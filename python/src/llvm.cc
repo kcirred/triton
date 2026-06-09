@@ -863,11 +863,17 @@ void init_triton_llvm(py::module &&m) {
   m.def("init_targets", []() {
     static std::once_flag init_flag;
     std::call_once(init_flag, []() {
+#ifdef TRITON_BUILD_TTIR_ONLY
+      llvm::InitializeNativeTarget();
+      llvm::InitializeNativeTargetAsmParser();
+      llvm::InitializeNativeTargetAsmPrinter();
+#else
       llvm::InitializeAllTargetInfos();
       llvm::InitializeAllTargets();
       llvm::InitializeAllTargetMCs();
       llvm::InitializeAllAsmParsers();
       llvm::InitializeAllAsmPrinters();
+#endif
     });
     // Disable LLVM's internal parallelism. Triton kernels produce small LLVM
     // modules where pass-level parallelism is not beneficial, and LLVM's global

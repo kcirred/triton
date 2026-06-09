@@ -1,48 +1,52 @@
-name: Report a bug
-description: Report triton failing to compile a kernel, or giving incorrect results
+name: Report a Triton-Spyre bug
+description: Report a build, lowering, or test failure in the Spyre backend
 labels: ["bug"]
 
 body:
 - type: markdown
   attributes:
     value: |
-      #### Disclaimer
-      The core triton team is small and has very limited capacity. We may not have time to look into your report.
-      For the best results, please:
-        - Avoid submitting duplicates. Search through [the existing and past issues](https://github.com/triton-lang/triton/issues?q=is%3Aissue+sort%3Acreated-desc+) first to see if it's been reported previously.
-        - Check if the issue persists with a build from the latest source.
-        - Provide all relevant information in the initial report, to prevent unnecessary back and forth discussion.
-        - If you can, try to diagnose and/or fix the issue yourself. We welcome high quality contributions.
+      Thanks for helping improve Triton-Spyre.
+
+      Before opening a new issue, please search existing issues in this
+      repository and check whether the problem still occurs with the latest
+      source.
 - type: textarea
   attributes:
-    label: Describe the bug
+    label: What happened?
     description: |
-      Please provide a clear and concise description of what the bug is.
+      Describe the failure and what you expected instead.
 
-      If relevant, add a [minimal complete example](https://stackoverflow.com/help/minimal-reproducible-example) that reproduces the bug. It is very important for the snippet to be as simple as possible, so please take time to trim down any irrelevant code to help us debug efficiently. We are going to copy-paste your code and we expect to get the same result as you did, so include both the kernel and launching code as well as any relevant imports.
-
-      If the code is too long (hopefully, it isn't), feel free to put it in a public gist and link it in the issue: https://gist.github.com.
-
-      Please also paste or describe the results you observe instead of the expected results. If you observe an error, please paste the error message including the **full** traceback of the exception. It may be relevant to wrap error messages in ```` ```triple quotes blocks``` ````.
+      If possible, include a minimal Triton kernel, TTIR/KTIR snippet, or
+      command that reproduces the problem.
     placeholder: |
-      A clear and concise description of what the bug is.
+      A clear description of the failure.
 
       ```python
-      # Sample code to reproduce the problem
+      # Minimal reproducer, if available
       ```
 
       ```
-      The error message you got, with the full traceback.
+      Full error output or traceback, if available.
       ```
   validations:
     required: true
 - type: textarea
   attributes:
-    label: Environment details
-    description: |
-      Please include any relevant context about how you're running the reproducer e.g. which version of triton, and what GPU you are using.
+    label: Environment
+    description: Include the details needed to reproduce the problem.
     placeholder: |
-        Triton: ...
-        GPU: ...
+      OS:
+      Python:
+      Repository commit:
+      Install command:
+      TRITON_BACKENDS:
+      Submodules initialized: yes/no
   validations:
     required: true
+- type: textarea
+  attributes:
+    label: Additional context
+    description: Add logs, generated IR, links to fixtures, or other context that may help.
+  validations:
+    required: false

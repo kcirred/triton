@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
-  - name: Community help
-    url: https://discord.gg/gpumode
-    about: GPU-mode discord community has a triton channel which is a great resource for help writing/learning triton
+  - name: Upstream Triton
+    url: https://github.com/triton-lang/triton
+    about: Use upstream Triton for issues that are not specific to the Spyre backend or KTIR lowering path.

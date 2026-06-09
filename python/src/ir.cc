@@ -26,15 +26,19 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/LocationSnapshot.h"
 
+#ifndef TRITON_BUILD_TTIR_ONLY
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
+#endif
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#ifndef TRITON_BUILD_TTIR_ONLY
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#endif
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/Dump.hpp"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -46,8 +50,10 @@ namespace py = pybind11;
 using namespace mlir;
 using namespace triton;
 namespace tt = triton;
+#ifndef TRITON_BUILD_TTIR_ONLY
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
+#endif
 
 // Function to parse a comma-separated string into a vector of C-style strings
 llvm::SmallVector<const char *, 3>
@@ -162,6 +168,7 @@ OpPrintingFlags getOpPrintingFlags() {
   return printingFlags;
 }
 
+#ifndef TRITON_BUILD_TTIR_ONLY
 py::list getTensorDescMetadata(ModuleOp &mod) {
   TritonSourceMgrDiagnosticHandler handler =
       setupTritonDiagnosticHandler(mod.getContext());
@@ -226,6 +233,7 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
   }
   return result;
 }
+#endif
 
 } // anonymous namespace
 
@@ -341,13 +349,17 @@ void init_triton_ir(py::module &&m) {
       plugin.registerDialects(registry);
     }
 
-    registry.insert<TritonDialect, ::mlir::triton::gpu::TritonGPUDialect,
+    registry.insert<TritonDialect,
+#ifndef TRITON_BUILD_TTIR_ONLY
+                    ::mlir::triton::gpu::TritonGPUDialect,
                     ::mlir::triton::instrument::TritonInstrumentDialect,
                     ::mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
+                    ::mlir::gpu::GPUDialect,
+                    mlir::triton::gluon::GluonDialect,
+#endif
                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
-                    ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
-                    LLVM::LLVMDialect, mlir::ub::UBDialect,
-                    mlir::triton::gluon::GluonDialect>();
+                    cf::ControlFlowDialect,
+                    LLVM::LLVMDialect, mlir::ub::UBDialect>();
     mlir::LLVM::registerInlinerInterface(registry);
     registerBuiltinDialectTranslation(registry);
     registerLLVMDialectTranslation(registry);
@@ -754,7 +766,9 @@ void init_triton_ir(py::module &&m) {
                return py::none();
              return py::int_(ret.getInt());
            })
+#ifndef TRITON_BUILD_TTIR_ONLY
       .def("get_tensordesc_metadata", getTensorDescMetadata)
+#endif
       .def("create_location_snapshot",
            [](ModuleOp &self, const std::string &fileName) -> void {
              auto printingFlags = getOpPrintingFlags();
@@ -1844,11 +1858,13 @@ void init_triton_ir(py::module &&m) {
       .def("create_gather",
            [](TritonOpBuilder &self, Value src, Value indices, int axis)
                -> Value { return self.create<GatherOp>(src, indices, axis); })
+#ifndef TRITON_BUILD_TTIR_ONLY
       // Force GPU barrier
       .def("create_barrier",
            [](TritonOpBuilder &self) {
              self.create<triton::gpu::BarrierOp>(triton::gpu::AddrSpace::All);
            })
+#endif
       // Make a tensor descriptor
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,

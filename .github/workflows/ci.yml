@@ -1,43 +1,97 @@
-name: Integration Tests
+name: Spyre CI
+
 on:
   workflow_dispatch:
   pull_request:
-    branches-ignore: ['llvm-**']
-  merge_group:
-    branches: [main, 'dev-**']
-    types: [checks_requested]
   push:
     branches: [main]
+
 concurrency:
   group: ${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions: read-all
 
 jobs:
+  spyre-tests:
+    name: Spyre tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
 
-  runner-preparation:
-    uses: ./.github/workflows/runner-preparation.yml
+    env:
+      # Point uv at the explicit venv created below, so `uv run` and
+      # `uv pip` operate on it without manual activation.
+      UV_PROJECT_ENVIRONMENT: .venv
 
-  pre-commit:
-    uses: ./.github/workflows/pre-commit.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
 
-  integration-tests-nvidia:
-    needs: runner-preparation
-    if: needs.runner-preparation.outputs.matrix-NVIDIA != ''
-    uses: ./.github/workflows/integration-tests-nvidia.yml
-    with:
-      matrix: ${{ needs.runner-preparation.outputs.matrix-NVIDIA }}
+      - name: Initialize submodules
+        run: |
+          git config submodule.third_party/spyre/ktir-mlir-frontend.url https://github.com/torch-spyre/ktir-mlir-frontend.git
+          git submodule update --init --recursive
 
-  integration-tests-amd:
-    needs: runner-preparation
-    if: needs.runner-preparation.outputs.matrix-AMD != ''
-    uses: ./.github/workflows/integration-tests-amd.yml
-    with:
-      matrix: ${{ needs.runner-preparation.outputs.matrix-AMD }}
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
-  build-macos:
-    needs: runner-preparation
-    if: needs.runner-preparation.outputs.matrix-MACOS != ''
-    uses: ./.github/workflows/build-macos.yml
-    with:
-      matrix: ${{ needs.runner-preparation.outputs.matrix-MACOS }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Create virtual environment
+        run: |
+          uv venv .venv --python 3.12 --python-preference managed --seed
+
+      - name: Install build dependencies
+        run: |
+          uv pip install $(uv run python -c "import tomllib; print(' '.join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))")
+
+      - name: Install Triton-Spyre
+        env:
+          TRITON_BACKENDS: spyre
+          MAX_JOBS: "4"
+          # The built-in token has cross-repo actions:read for the MLIR
+          # artifacts published by torch-spyre/ktir-mlir-frontend. On a
+          # spyre-only build, setup.py invokes the submodule's setup_mlir.py,
+          # which reads GIT_PAT to download and cache them. Same pattern as
+          # torch-spyre/ktir-cpu's CI.
+          GIT_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          uv pip install -e ".[spyre-test]" --no-build-isolation
+
+      - name: Run tests
+        run: |
+          uv run python -m pytest third_party/spyre/test -v -s --tb=short
+
+  docs-patterns:
+    name: docs/patterns up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # The pattern-doc generator imports the fixture/test modules to read their
+    # static metadata, but it stubs Triton (and gluon_ir) when the compiled
+    # extension is absent — so this runs WITHOUT the Spyre build. It needs only
+    # the Triton Python package on PYTHONPATH plus numpy + pytest (the fixtures
+    # import numpy; the single-pass test files import pytest at module scope).
+    # Regenerate locally with gen_patterns_docs.py and commit if this fails.
+    env:
+      PYTHONPATH: python
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Check docs/patterns up to date
+        run: |
+          uv run --no-project --with numpy --with pytest \
+            python third_party/spyre/scripts/gen_patterns_docs.py --check

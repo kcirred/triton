@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+"""
+Unit tests for individual LowerDescriptorMemory conversion patterns.
+
+Organization: one test class per Triton descriptor op (TestDescriptorLoad,
+TestDescriptorStore, TestDescriptorGather, TestDescriptorScatter).  Each
+class contains positive tests for static/dynamic shape variants plus
+negative tests for expected failure modes.
+
+Note on TTIR types: tt.make_tensor_descriptor requires shape operands as
+i32 and stride operands as i64 (see TritonOps.td: Variadic<I32>:$shape,
+Variadic<I64>:$strides).  The MLIR in test strings must match these types.
+
+Shape vs block shape:
+  tt.make_tensor_descriptor shape args = full tensor dimensions (e.g. 1024)
+  tt.tensordesc<BxC> type              = block (tile) shape (e.g. 64)
+  The memory view must use the full tensor shape; the access tile carries
+  the block shape and is positioned by the load/store indices.
+"""
+
+import re
+
+import pytest
+from conftest import SinglePassTester
+from utils_pattern import pattern
+
+
+class LowerDescMemoryTester(SinglePassTester):
+    """Shared base for all LowerDescriptorMemory pattern tests."""
+    PASS = "add_lower_descriptor_memory"
+
+
+# =========================================================================
+# tt.descriptor_load → construct_memory_view + construct_access_tile + load
+# =========================================================================
+
+class TestDescriptorLoad(LowerDescMemoryTester):
+    # tt.descriptor_load → ktdp.load via memory view + access tile.
+    # Memory view uses the full tensor shape (not the block shape).
+    #
+    # tt.make_tensor_descriptor syntax:
+    #   tt.make_tensor_descriptor %ptr, [shape...], [strides...] : <elem>, <block>
+    #
+    #   shape operands (i32) — full tensor dimensions, e.g. [1024, 64]
+    #   strides operands (i64) — element strides for each dimension
+    #   result type <BM x BK x elem> — block (tile) shape, e.g. <32x64xf16>
+    #
+    # Example: a 1024×64 tensor tiled with 32×64 blocks:
+    #   %desc = tt.make_tensor_descriptor %ptr, [%M=1024, %K=64], [64, 1]
+    #               : <f16>, <32x64xf16>
+    #   → memory view covers the full 1024×64 tensor
+    #   → each load/store positions a 32×64 access tile at the given indices
+    #
+    # test_static_shape_1d[N]          — 1-D, parametrized over N values
+    # test_static_shape_2d[M,K]        — 2-D, parametrized over (M,K) pairs
+    # test_memory_view_full_shape      — full tensor shape, not block shape
+    # test_elem_type[f16/f32/bf16/f64] — pass is not f16-specific
+    # test_dynamic_shape_1d            — 1-D, runtime shape → memref<?xf16>
+    # test_dynamic_shape_2d            — 2-D, both dims runtime → memref<?x?xf16>
+
+    @pattern("descriptor-load-static", category="memory", example=[
+        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
+        "tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>",
+    ])
+    @pytest.mark.parametrize("N", [512, 1024, 4096])
+    def test_static_shape_1d(self, N):
+        """Load a 1-D tile from a statically-shaped tensor descriptor.
+
+        ``tt.make_tensor_descriptor`` with a compile-time constant shape lowers
+        to ``ktdp.construct_memory_view`` (full tensor extent baked in) +
+        ``ktdp.construct_access_tile`` (block-sized tile positioned by the load
+        index) + ``ktdp.load``.  The block shape (e.g. 64) lives only on the
+        access tile; the memory view always carries the full tensor size.
+        """
+        # 1-D load.  %N is an arith.constant — known at compile time.
+        # The memory view gets shape [N]; the access tile is positioned by %off.
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<f16>, %off: i32) {{
+            %N = arith.constant {N} : i32      // full tensor size — compile-time constant
+            %stride = arith.constant 1 : i64   // element stride (contiguous)
+            %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                : <f16>, <64xf16>              // block shape = 64 (tile size)
+            %data = tt.descriptor_load %desc[%off]
+                : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_load")
+        self.assert_result("ktdp.construct_memory_view", shape=[N], elem_type="f16")
+        self.assert_result_type("ktdp.construct_access_tile", "xindex")
+        # coordinate_set: 1 dim, 0 symbols (static), 2 constraints (lo ≥ 0, hi ≤ N−1)
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+        # access_tile_set: 1 dim, 0 symbols, 2 constraints (lo ≥ 0, hi ≤ 63 = block−1)
+        self.assert_integer_set("ktdp.construct_access_tile", "access_tile_set",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+
+    @pytest.mark.parametrize("M,K", [(512, 64), (1024, 128), (2048, 256)])
+    def test_static_shape_2d(self, M, K):
+        # 2-D load.  %M and %K are arith.constant — known at compile time.
+        # %m, %k are the tile's top-left corner in the full tensor (not the tile size).
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<f16>, %m: i32, %k: i32) {{
+            %M = arith.constant {M} : i32          // full tensor rows — compile-time
+            %K = arith.constant {K} : i32          // full tensor cols — compile-time
+            %stride_row = arith.constant {K} : i64 // row stride = K (row-major)
+            %stride_col = arith.constant 1 : i64   // col stride = 1 (contiguous)
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <32x64xf16>               // block shape = 32×64 (tile size)
+            %data = tt.descriptor_load %desc[%m, %k]  // %m, %k: tile position in full tensor
+                : !tt.tensordesc<32x64xf16> -> tensor<32x64xf16>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_load")
+        self.assert_result("ktdp.construct_memory_view", shape=[M, K], elem_type="f16")
+        # coordinate_set: 2 dims, 0 symbols, 4 constraints (lo/hi per dim)
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+        # access_tile_set: 2 dims, range [0,31]×[0,63] = block shape − 1
+        self.assert_integer_set("ktdp.construct_access_tile", "access_tile_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+
+    def test_memory_view_full_shape(self):
+        # Memory view should describe the full tensor, not the block.
+        # tt.make_tensor_descriptor shape [%N=1024] is the full tensor size.
+        # The block shape <64xf16> is the tile — only the access tile uses it.
+        # The memory view must cover [1024], not [64].
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %off: i32) {
+            %N = arith.constant 1024 : i32     // full tensor size
+            %stride = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                : <f16>, <64xf16>              // block shape = 64
+            %data = tt.descriptor_load %desc[%off]
+                : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            tt.return
+          }
+        }
+        """)
+        # Memory view must use full tensor shape [1024], not block shape [64]
+        self.assert_result("ktdp.construct_memory_view", shape=[1024],
+                           elem_type="f16")
+        self.assert_result("ktdp.construct_memory_view", shape_not=[64])
+
+    @pytest.mark.parametrize("elem", ["f16", "f32", "bf16", "f64"])
+    def test_elem_type(self, elem):
+        # elem in make_tensor_descriptor comes from the pointer type.
+        # The pass is not f16-specific; the element type flows through to the
+        # memref type unchanged.
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<{elem}>, %off: i32) {{
+            %N = arith.constant 1024 : i32
+            %stride = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                : <{elem}>, <64x{elem}>
+            %data = tt.descriptor_load %desc[%off]
+                : !tt.tensordesc<64x{elem}> -> tensor<64x{elem}>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_load")
+        self.assert_result("ktdp.construct_memory_view", shape=[1024], elem_type=elem)
+        self.assert_result("ktdp.load", shape=[64], elem_type=elem)
+
+    @pattern("descriptor-load-dynamic", category="memory", example=[
+        "# N is a runtime kernel argument — descriptor emits memref<?xf16>",
+        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
+        "tile = tl.descriptor_load(desc, [pid * BLOCK])",
+    ])
+    def test_dynamic_shape_1d(self):
+        """Load from a 1-D descriptor whose shape is a runtime argument.
+
+        When the tensor size ``%N`` is a ``tt.func`` argument rather than an
+        ``arith.constant``, the compiler cannot see it at compile time and emits
+        ``kDynamic`` for that dimension — producing ``memref<?xf16>``.  The
+        ``coordinate_set`` gains an ``IntegerSet`` symbol bound to ``%N`` at
+        runtime so the range constraint remains correct.
+        """
+        # %N is a tt.func argument (not an arith.constant), so buildBaseMemoryView
+        # cannot extract a compile-time size — it emits kDynamic, producing
+        # memref<?xf16>.  The coordinate_set uses an IntegerSet symbol bound to
+        # the runtime %N value, so the range constraint is correct at runtime.
+        #
+        # NOTE: Full-pipeline execution requires the KTIR CPU backend to support
+        # dynamic memrefs — verify end-to-end before using in production.
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %off: i32, %N: i32) {
+            // %N is a runtime argument — not a compile-time constant
+            %stride = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                : <f16>, <64xf16>
+            %data = tt.descriptor_load %desc[%off]
+                : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view", "ktdp.load")
+        self.assert_absent("tt.descriptor_load")
+        # Runtime shape → memref<?xf16>; coordinate_set has 1 dim, 1 symbol, 2 constraints
+        self.assert_result_type("ktdp.construct_memory_view", "memref<?")
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=1, num_symbols=1, num_constraints=2)
+        # Dynamic size becomes operand 1 (cast from i32 to index by arith.index_cast)
+        self.assert_operand("ktdp.construct_memory_view", 1,
+                            defined_by="arith.index_cast", type_substr="index")
+
+    @pattern("descriptor-load-dynamic", category="memory", example=[
+        "# M and K are runtime kernel arguments — descriptor emits memref<?x?xf16>",
+        "desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],",
+        "                                 block_shape=[BLOCK_M, BLOCK_K])",
+        "tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])",
+    ])
+    def test_dynamic_shape_2d(self):
+        """Load from a 2-D descriptor where both dimensions are runtime arguments.
+
+        Both ``%M`` and ``%K`` arrive as ``tt.func`` arguments, so the compiler
+        emits ``kDynamic`` for each — producing ``memref<?x?xf16>``.  Each
+        dynamic dimension gets its own ``IntegerSet`` symbol in the
+        ``coordinate_set``, bound positionally to the corresponding ``dynSizes``
+        operand.  The block (tile) shape in the descriptor type is always fixed
+        at compile time.
+        """
+        # %M and %K are tt.func arguments (not arith.constant), so the compiler
+        # cannot see the tensor size at compile time — both dims become kDynamic,
+        # producing memref<?x?xf16>.  buildRangeSetND emits one IntegerSet symbol
+        # per dynamic dim, each bound positionally to the corresponding dynSizes
+        # operand, so the range constraint is correct at runtime.
+        #
+        # Note: <32x64xf16> is the block (tile) shape encoded in the descriptor
+        # type — it is always fixed at compile time.  Only the full tensor
+        # dimensions [%M, %K] are dynamic here.
+        #
+        # NOTE: Full-pipeline execution requires the KTIR CPU backend to support
+        # dynamic memrefs — verify end-to-end before using in production.
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %m: i32, %k: i32,
+                     %M: i32, %K: i32) {
+            // %M, %K are runtime arguments — full tensor dims are not compile-time constants
+            // block shape <32x64xf16> in the descriptor type is fixed at compile time
+            %stride_row = arith.constant 64 : i64  // row stride — still static
+            %stride_col = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K],
+                        [%stride_row, %stride_col] : <f16>, <32x64xf16>
+            %data = tt.descriptor_load %desc[%m, %k]  // %m, %k: tile position
+                : !tt.tensordesc<32x64xf16> -> tensor<32x64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view", "ktdp.load")
+        self.assert_absent("tt.descriptor_load")
+        # Both runtime dims → memref<?x?xf16>; coordinate_set has 2 dims, 2 symbols, 4 constraints
+        self.assert_result_type("ktdp.construct_memory_view", "memref<?x?")
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=2, num_symbols=2, num_constraints=4)
+
+
+# =========================================================================
+# tt.descriptor_store → construct_memory_view + construct_access_tile + store
+# =========================================================================
+
+class TestDescriptorStore(LowerDescMemoryTester):
+    # tt.descriptor_store → ktdp.store via memory view + access tile.
+    # Same structure as load — memory view over full tensor, access tile
+    # at block position.  Only the final op differs (store vs load).
+    #
+    # tt.make_tensor_descriptor syntax (same as load):
+    #   shape operands (i32) — full tensor dimensions
+    #   strides operands (i64) — element strides
+    #   result type <BM x BK x elem> — block (tile) shape
+    #
+    # test_static_shape_1d[N]   — 1-D, parametrized over N values
+    # test_static_shape_2d[M,K] — 2-D, parametrized over (M,K) pairs
+    # test_dynamic_shape_1d     — non-constant shape produces memref<?>
+
+    @pattern("descriptor-store-static", category="memory", example=[
+        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
+        "tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>",
+    ])
+    @pytest.mark.parametrize("N", [512, 1024, 4096])
+    def test_static_shape_1d(self, N):
+        # 1-D store.  %N is arith.constant — the memory view gets shape [N].
+        # %data is the tensor<64xf16> tile to write; %off is the tile position.
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<f16>, %off: i32, %data: tensor<64xf16>) {{
+            %N = arith.constant {N} : i32      // full tensor size — compile-time
+            %stride = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                : <f16>, <64xf16>              // block shape = 64
+            tt.descriptor_store %desc[%off], %data
+                : !tt.tensordesc<64xf16>, tensor<64xf16>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_access_tile", "ktdp.store")
+        self.assert_absent("tt.descriptor_store")
+        self.assert_result("ktdp.construct_memory_view", shape=[N], elem_type="f16")
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+        self.assert_integer_set("ktdp.construct_access_tile", "access_tile_set",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+
+    @pytest.mark.parametrize("M,K", [(512, 64), (1024, 128), (2048, 256)])
+    def test_static_shape_2d(self, M, K):
+        # 2-D store.  %M and %K are arith.constant — memory view gets shape [M, K].
+        # %data is the tensor<32x64xf16> tile to write; %m, %k are the tile position.
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<f16>, %m: i32, %k: i32,
+                     %data: tensor<32x64xf16>) {{
+            %M = arith.constant {M} : i32          // full tensor rows — compile-time
+            %K = arith.constant {K} : i32          // full tensor cols — compile-time
+            %stride_row = arith.constant {K} : i64 // row stride = K (row-major)
+            %stride_col = arith.constant 1 : i64   // col stride = 1 (contiguous)
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <32x64xf16>               // block shape = 32×64 (tile size)
+            tt.descriptor_store %desc[%m, %k], %data  // %m, %k: tile position
+                : !tt.tensordesc<32x64xf16>, tensor<32x64xf16>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_access_tile", "ktdp.store")
+        self.assert_absent("tt.descriptor_store")
+        self.assert_result("ktdp.construct_memory_view", shape=[M, K], elem_type="f16")
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+        self.assert_integer_set("ktdp.construct_access_tile", "access_tile_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+
+    @pattern("descriptor-store-dynamic", category="memory", example=[
+        "# N is a runtime kernel argument — descriptor emits memref<?xf16>",
+        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
+        "tl.descriptor_store(desc, tile, [pid * BLOCK])",
+    ])
+    def test_dynamic_shape_1d(self):
+        # %N is a tt.func argument (not an arith.constant), producing memref<?xf16>.
+        # The coordinate_set uses an IntegerSet symbol bound to the runtime %N value.
+        #
+        # Full-pipeline execution requires the KTIR CPU backend to support
+        # dynamic memrefs — verify end-to-end before using in production.
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %off: i32, %N: i32,
+                     %data: tensor<64xf16>) {
+            // %N is a runtime argument — not a compile-time constant
+            %stride = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                : <f16>, <64xf16>
+            tt.descriptor_store %desc[%off], %data
+                : !tt.tensordesc<64xf16>, tensor<64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view", "ktdp.store")
+        self.assert_absent("tt.descriptor_store")
+        # Runtime shape → memref<?xf16>; coordinate_set has 1 dim, 1 symbol, 2 constraints
+        self.assert_result_type("ktdp.construct_memory_view", "memref<?")
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=1, num_symbols=1, num_constraints=2)
+
+# =========================================================================
+# tt.descriptor_load with rank-reduced result — NOT YET LOWERED
+# =========================================================================
+
+class TestRankReducedDescriptorLoad(LowerDescMemoryTester):
+    """Descriptor with leading singleton dim + rank-reduced load result: not yet supported.
+
+    A common Triton idiom for 3D batched matmul — see
+
+        a_desc = tl.make_tensor_descriptor(a_ptr,
+            shape=[B, M, K], strides=[M*K, K, 1],
+            block_shape=[1, BLOCK_M, BLOCK_K])
+        a3 = a_desc.load([b_idx, m, k])           # frontend: tensor<1xBLOCK_MxBLOCK_K>
+        a2 = tl.reshape(a3, [BLOCK_M, BLOCK_K])   # required for tl.dot (2D-only)
+
+    Upstream Triton's ``RankedReduceDescriptorLoads`` pattern in the
+    ``triton-combine`` pass (``lib/Dialect/Triton/Transforms/Combine.cpp``;
+    invoked as ``passes.ttir.add_combine`` in the spyre ``_make_ttir``
+    pipeline) folds the ``tt.reshape(tt.descriptor_load)`` pattern into
+    a rank-reduced load when the dropped dims are size 1. After
+    ``add_combine`` runs, the descriptor stays 3D
+    (``!tt.tensordesc<1x16x16xf32>``) but the load's result type
+    becomes 2D (``tensor<16x16xf32>``). ``DescriptorLoadOp::verify``
+    accepts this because it checks element count, not rank — and
+    1*16*16 == 16*16.
+
+    Current state: ``LowerDescriptorMemory`` builds the
+    ``ktdp.construct_access_tile`` from the descriptor's 3D
+    ``block_shape`` (``[1, 16, 16]``) and emits a 3D ``ktdp.load``,
+    but ``ktdp.load`` requires its access tile shape to match the
+    result tensor shape — which is 2D. The op verifier raises
+    ``access tile shape must match result tensor shape`` and the
+    pipeline fails.
+
+    Fix plan: ``LowerDescriptorMemory`` should detect when the
+    descriptor's ``block_shape`` rank exceeds the load result's
+    rank and the dropped leading dims are all size 1, then either
+    (a) emit the access tile + ``ktdp.load`` at the reduced rank
+    directly, or (b) emit at full rank and insert a
+    ``tensor.collapse_shape`` to bring the ``ktdp.load`` result down
+    to 2D, to match the 2D uses of ``tt.descriptor_load`` in the
+    rest of the IR.
+    Once fixed, delete this test in favor of a positive
+    rank-reduced-load test.
+    """
+
+    @pattern("descriptor-rank-reduce", category="memory", negative=True, example=[
+        "# NOT supported: 3D descriptor with rank-reduced (2D) load result",
+        "# Produced by triton-combine when it folds tt.reshape(tt.descriptor_load)",
+        "# where the reshaped-away leading dims are all size 1:",
+        "a_desc = tl.make_tensor_descriptor(a_ptr,",
+        "    shape=[B, M, K], strides=[M*K, K, 1],",
+        "    block_shape=[1, BLOCK_M, BLOCK_K])  # 3D descriptor",
+        "a = tl.reshape(a_desc.load([b, m, k]), [BLOCK_M, BLOCK_K])  # rank-reduced",
+    ])
+    def test_rank_reduced_load_fails(self, capfd):
+        # Minimal reproducer: a 3D descriptor whose load result has
+        # been rank-reduced to 2D. We hand-write the post-combine IR
+        # directly because SinglePassTester runs only the named pass —
+        # the triton-combine pass (RankedReduceDescriptorLoads) that
+        # would produce this shape mismatch from a tt.reshape pattern
+        # is not in the pipeline.
+        #
+        # Element count agrees (1*16*16 == 16*16 == 256) so
+        # DescriptorLoadOp::verify accepts the IR. The mismatch
+        # only fires in LowerDescriptorMemory when ktdp.load is
+        # built with the descriptor's 3D access tile and the
+        # original 2D result type.
+        with pytest.raises(RuntimeError, match="PassManager::run failed"):
+            self.run("""
+            module {
+              tt.func @k(%ptr: !tt.ptr<f32>, %b_idx: i32, %m: i32, %k: i32) {
+                %B = arith.constant 4 : i32          // full tensor batch
+                %M = arith.constant 128 : i32        // full tensor rows
+                %K = arith.constant 32 : i32         // full tensor cols
+                %stride_b = arith.constant 4096 : i64  // M*K = 128*32
+                %stride_m = arith.constant 32 : i64    // K
+                %stride_k = arith.constant 1 : i64
+                %desc = tt.make_tensor_descriptor %ptr, [%B, %M, %K],
+                            [%stride_b, %stride_m, %stride_k]
+                          : <f32>, <1x16x16xf32>     // 3D block: leading 1
+                // Result is 2D — the rank-reduced shape produced by the
+                // triton-combine pass when an explicit tt.reshape collapses
+                // the leading singleton. Element count matches (256 == 256),
+                // so DescriptorLoadOp::verify accepts this IR.
+                %data = tt.descriptor_load %desc[%b_idx, %m, %k]
+                          : !tt.tensordesc<1x16x16xf32> -> tensor<16x16xf32>
+                tt.return
+              }
+            }
+            """)
+        # Pin the exact verifier diagnostic from ktdp.load. A drift in
+        # the error text (e.g. if the verifier message is rephrased)
+        # or a fix that closes the gap will flag here.
+        self.assert_stderr(capfd,
+                           "ktdp.load",
+                           "access tile shape must match result tensor shape")
+
+# =========================================================================
+# tt.descriptor_gather → construct_memory_view + construct_indirect_access_tile + load
+# =========================================================================
+
+class TestDescriptorGather(LowerDescMemoryTester):
+    # tt.descriptor_gather → ktdp.load via indirect access tile.
+    #
+    # Gather reads non-contiguous rows from a 2-D tensor.  The block type
+    # must have exactly 1 row; the number of rows actually gathered comes
+    # from x_offsets, not the block shape.
+    #
+    # Example: a 1024×128 tensor, gathering 32 non-contiguous rows,
+    # reading a 64-wide column slice starting at y_offset:
+    #   %desc = tt.make_tensor_descriptor %ptr, [%M=1024, %K=128], [128, 1]
+    #               : <f16>, <1x64xf16>          // block: 1 row × 64 cols
+    #   %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+    #               : (..., tensor<32xi32>, i32) -> tensor<32x64xf16>
+    #   → memory view covers the full 1024×128 tensor (memref<1024x128xf16>)
+    #   → x_offsets (tensor<32xi32>) names the 32 row indices to read
+    #   → y_offset is the starting column for the 64-wide tile within each row
+    #      (e.g. y_offset=0 → cols 0–63, y_offset=64 → cols 64–127)
+    #   → result shape [32, 64] = [len(x_offsets), block_cols]
+    #
+    # tt.make_tensor_descriptor: shape operands are i32, strides are i64.
+    #
+    # test_gather_2d[M,K]            — row-gather, parametrized over (M,K) pairs;
+    #                                   x_offsets is staged via descriptor_load
+    # test_gather_base_memview_shape — base memory view has full tensor shape
+    # test_gather_from_descriptor_load_emits_no_cast
+    #                                 — descriptor-load provenance: the trace
+    #                                   path reuses the upstream memory view
+    #                                   instead of inserting a cast.
+    # test_gather_from_descriptor_load_captures_x_offset
+    #                                 — same path, but with a non-zero
+    #                                   descriptor_load offset.  Pins that
+    #                                   the offset is threaded into the
+    #                                   indirect subscript as
+    #                                   `idx[<offset> + d0]` rather than
+    #                                   silently dropped.
+    # test_gather_with_x_offsets_arg_fails_to_legalize
+    #                                 — x_offsets as a tensor-typed function
+    #                                   arg has no traceable provenance, so
+    #                                   the gather pattern returns failure()
+    #                                   and applyPartialConversion emits
+    #                                   "failed to legalize 'tt.descriptor_gather'".
+    # test_descriptor_from_arg_fails — descriptor from block arg fails lowering
+
+    @pattern("descriptor-gather", category="memory", example=[
+        "# Gather 32 non-contiguous rows from a 2D tensor",
+        "result = tl.descriptor_gather(desc, x_offsets, y_offset)",
+        "# lowers to ktdp.construct_indirect_access_tile + ktdp.load",
+    ])
+    @pytest.mark.parametrize("M,K", [(512, 128), (1024, 128), (2048, 256)])
+    def test_gather_2d(self, M, K):
+        # Row-gather: x_offsets (tensor<32xi32>) names 32 non-contiguous rows.
+        # The block type <1x64xf16> means each row tile is 1×64; gather fans
+        # this out to 32 separate rows → result shape tensor<32x64xf16>.
+        # y_offset is the starting column for the 64-wide tile within each row
+        # (e.g. 0 → cols 0–63, 64 → cols 64–127 in a 128-col tensor).
+        # The indirect access tile (not the direct one used by load/store) holds
+        # the x_offsets buffer and a region with the per-row subscript maps.
+        #
+        # x_offsets is staged via a 1-D descriptor_load — the only provenance
+        # the gather pattern accepts after the fallback removal (see
+        # docs/gather_fallback_deep_dive.md).  Spyre kernels always pass index
+        # buffers as !tt.ptr<i32> + tt.descriptor_load.
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,      // raw index buffer (HBM ptr)
+                     %y_offset: i32) {{           // starting column for the 64-wide tile
+            %M = arith.constant {M} : i32         // full tensor rows — compile-time
+            %K = arith.constant {K} : i32         // full tensor cols — compile-time
+            %stride_row = arith.constant {K} : i64  // row stride = K (row-major)
+            %stride_col = arith.constant 1 : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1 : i64
+            %c0_i32     = arith.constant 0 : i32
+
+            // Stage the row indices via a 1-D descriptor — what real kernels do.
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>               // block: 1 row × 64 cols (gather constraint)
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                // result: 32 gathered rows × 64 cols
+                : (!tt.tensordesc<1x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        # No cast: the trace path reuses the index descriptor's memory view.
+        self.assert_absent("unrealized_conversion_cast")
+        self.assert_has_region("ktdp.construct_indirect_access_tile")
+        # Two memory views: one for the index buffer, one for the base table.
+        # A regression that re-introduced the fallback would build a third.
+        self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
+        # Base-table memory view: 2 dims, 0 symbols, 4 constraints (lo/hi per dim).
+        # assert_result matches by shape= so it picks the base view (not the
+        # 1-D index view, whose shape is [32]).
+        self.assert_result("ktdp.construct_memory_view", shape=[M, K], elem_type="f16")
+        # Base-table coordinate_set: 2 dims, 0 symbols, 4 constraints. The
+        # 1-D index-buffer view has only 2 constraints, so this assertion
+        # picks the 2-D view (assert_integer_set is "any match").
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+        # variables_space_set: [0,31]×[0,63] = [len(x_offsets)−1, block_cols−1]
+        self.assert_integer_set("ktdp.construct_indirect_access_tile", "variables_space_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+        # gather load result shape = [len(x_offsets), block_cols].  The
+        # descriptor_load for the index buffer also produces a ktdp.load with
+        # shape [32]; assert_result matches by shape= so it picks the gather
+        # result (not the index load).
+        self.assert_result("ktdp.load", shape=[32, 64], elem_type="f16")
+
+    def test_gather_base_memview_shape(self):
+        # The block type <1x64xf16> is the tile size — only 64 cols are read per
+        # gather.  The memory view must still cover the full 1024×128 tensor so
+        # the access tile can address any column offset within each row.
+        # Assert shape=[1024, 128] (full tensor), not [1, 64] (block shape).
+        #
+        # x_offsets is staged via descriptor_load (the only legal provenance
+        # post-fallback-removal); the assertions here pin the *base* table
+        # memory view, not the index buffer's 1-D view, so they match by
+        # shape= regardless of how many memory views the lowering builds.
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %M = arith.constant 1024 : i32        // full tensor rows
+            %K = arith.constant 128 : i32         // full tensor cols
+            %stride_row = arith.constant 128 : i64  // row stride = K
+            %stride_col = arith.constant 1 : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1 : i64
+            %c0_i32     = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>               // block: 1 row × 64 cols
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+            tt.return
+          }
+        }
+        """)
+        # Memory view must use full tensor shape [1024, 128], not block shape [1, 64]
+        self.assert_result("ktdp.construct_memory_view", shape=[1024, 128],
+                           elem_type="f16")
+        self.assert_result("ktdp.construct_memory_view", shape_not=[1, 64])
+
+    def test_gather_from_descriptor_load_emits_no_cast(self):
+        # Compiled-kernel path: x_offsets is defined in the same function
+        # via a descriptor_load, not passed in as a function argument.
+        #
+        # buildIndirectAccessTile in LowerDescriptorMemory.cpp resolves
+        # x_offsets by walking
+        #   load → construct_access_tile → construct_memory_view
+        # and reusing the load's source memref directly — no cast inserted.
+        # If the trace fails (e.g. x_offsets is a tensor-typed block arg),
+        # the gather pattern returns failure() and applyPartialConversion
+        # surfaces the standard "failed to legalize" diagnostic; there is
+        # no longer a fallback that wraps the SSA value in a fresh memref
+        # via unrealized_conversion_cast.
+        #
+        # This test pins the trace-success path. A regression that makes
+        # the trace return nullopt for valid input would now fail to
+        # legalize instead of silently introducing a cast.
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %M = arith.constant 1024 : i32
+            %K = arith.constant 128 : i32
+            %stride_row = arith.constant 128 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_count = arith.constant 32 : i32
+            %idx_stride = arith.constant 1 : i64
+            %c0_i32 = arith.constant 0 : i32
+
+            // Load x_offsets via a descriptor — same idiom as the
+            // fixtures/gather/kernel.py compiled output.
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            // Gather that consumes the descriptor-loaded indices.
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+            tt.return
+          }
+        }
+        """)
+        # Core assertion: the trace path must eliminate the cast.
+        self.assert_absent("unrealized_conversion_cast")
+        # Both source ops are gone.
+        self.assert_absent("tt.descriptor_gather", "tt.descriptor_load")
+        # The downstream ktdp ops show up.
+        self.assert_present("ktdp.construct_indirect_access_tile",
+                            "ktdp.load")
+        # Exactly two memory views: one for the index tensor (reused
+        # from the descriptor_load lowering) and one for the base
+        # table.  A regression that constructs an extra view for the
+        # index buffer (e.g. by re-introducing a cast-based fallback)
+        # would bump this count to 3.
+        self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
+
+    @pattern("descriptor-gather", category="memory", example=[
+        "# Non-zero load offset is captured in the indirect subscript map",
+        "idx = idx_desc.load([offset_m])             # offset propagated",
+        "result = tl.descriptor_gather(desc, idx, y_offset)",
+        "# → ind(%idx[offset_m + d0]) in construct_indirect_access_tile",
+    ])
+    def test_gather_from_descriptor_load_captures_x_offset(self):
+        # Regression test for the embedding-fixture row-tile bug.
+        #
+        # When a kernel calls ``idx_desc.load([offset_m])`` inside a loop
+        # and then ``in_desc.gather(idx, ...)``, the gather must read
+        # ``indices[offset_m + d0]`` for d0 in [0, BLOCK_M) — not
+        # ``indices[d0]``.  Before the fix, traceToSourceMemoryView
+        # discarded the descriptor_load's offset operand, so the
+        # generated indirect access tile always indexed the index
+        # buffer's prefix, which silently corrupted every iteration of
+        # the loop except the one with offset = 0 (see
+        # fixtures/embedding/kernel.py and the original failure pattern:
+        # rows 0–7 correct, rows 8+ identical to rows 0–7).
+        #
+        # The fix captures the descriptor_load offset in the
+        # construct_indirect_access_tile's ``captured_variables`` and
+        # changes the indirect subscript map to ``c_x + d0``.  In the
+        # printed IR this manifests as ``ind(%idx[<ssa> + <iv>])``
+        # rather than ``ind(%idx[<iv>])``.
+        #
+        # We use a non-constant ``%offset`` (a function arg) so that the
+        # captured offset is visibly named in the IR, not folded away.
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %offset: i32,        // descriptor_load offset — opaque to the pass
+                     %y_offset: i32) {
+            %M = arith.constant 1024 : i32
+            %K = arith.constant 128 : i32
+            %stride_row = arith.constant 128 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_count = arith.constant 64 : i32
+            %idx_stride = arith.constant 1 : i64
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            // Non-zero offset — the value the fix must propagate.
+            %x_offsets = tt.descriptor_load %idx_desc[%offset]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+            tt.return
+          }
+        }
+        """)
+
+        # Lowering succeeded and produced an indirect access tile.
+        self.assert_present("ktdp.construct_indirect_access_tile")
+        self.assert_absent("tt.descriptor_gather", "tt.descriptor_load",
+                           "unrealized_conversion_cast")
+
+        # The printed indirect subscript must be `ind(%X[<lhs> + <rhs>])`,
+        # i.e. the row index is a sum — not a bare iv.  Matching by shape
+        # (sum vs no sum) keeps the assertion robust to SSA renaming.
+        text = str(self.mod)
+        m = re.search(r"ktdp\.construct_indirect_access_tile.*?ind\(([^\)]*)\)",
+                      text)
+        assert m, (
+            "expected a `ktdp.construct_indirect_access_tile … ind(…)` "
+            f"line in the rendered module:\n{text}"
+        )
+        indirect_subscript = m.group(1)  # e.g. "%idx[%off_idx + %arg4]"
+        assert " + " in indirect_subscript, (
+            "indirect subscript must include the captured x-offset "
+            f"(form `idx[<offset> + <iv>]`); got `ind({indirect_subscript})` "
+            f"in:\n{text}"
+        )
+
+    def test_gather_from_descriptor_load_signed_block_type(self):
+        """Regression: descriptor block ``<NxSI32>`` (signed) must trace
+        cleanly even though ``tt.descriptor_load`` canonicalises its
+        result tensor to ``tensor<NxI32>`` (signless).
+
+        Triton's frontend produces this asymmetry whenever the index
+        buffer is declared via ``!tt.ptr<i32>`` — the descriptor block
+        type comes out as ``si32`` while the load result stays as
+        signless ``i32``.  ``resolveIndexView`` therefore compares
+        element types by integer bit width, not by identity.
+
+        Without the bit-width compare, the assert in ``resolveIndexView``
+        (``"ConvertDescriptorLoad invariant violated"``) would fire on
+        every compiled gather kernel.  This test pins that case in a
+        ``SinglePassTester`` setup so the bit-width branch is exercised
+        without depending on the full Triton frontend.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %M = arith.constant 1024 : i32
+            %K = arith.constant 128 : i32
+            %stride_row = arith.constant 128 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_count = arith.constant 32 : i32
+            %idx_stride = arith.constant 1 : i64
+            %c0_i32 = arith.constant 0 : i32
+
+            // Signed descriptor block type — matches the IR Triton emits
+            // for an !tt.ptr<i32> index buffer.
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xsi32>
+            // Load result is signless — the mismatch the bit-width
+            // compare in resolveIndexView is there to absorb.
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xsi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+            tt.return
+          }
+        }
+        """)
+        # Lowering must succeed end-to-end — no unconverted descriptor
+        # ops, no fallback cast, indirect access tile present.
+        self.assert_absent("tt.descriptor_gather", "tt.descriptor_load",
+                           "unrealized_conversion_cast")
+        self.assert_present("ktdp.construct_indirect_access_tile",
+                            "ktdp.load")
+
+    @pattern("descriptor-gather", category="memory", negative=True, example=[
+        "# x_offsets as a function argument is REJECTED post-fallback-removal",
+        "# Spyre kernels must stage indices via tt.descriptor_load from a !tt.ptr<i32>",
+        "# arg; a tensor-typed kernel arg has no traceable provenance, so the gather",
+        "# pattern returns failure() and applyPartialConversion errors out.",
+    ])
+    def test_gather_with_x_offsets_arg_fails_to_legalize(self, capfd):
+        """An ``x_offsets`` that is a tensor-typed function argument is no
+        longer lowered. The gather pattern returns ``failure()`` on the
+        trace miss; ``applyPartialConversion`` then leaves the illegal
+        ``tt.descriptor_gather`` op in place and fails with its standard
+        "failed to legalize" diagnostic.
+
+        Reason this exists: prior to the fallback removal this same input
+        lowered through a path that built a fresh memref via
+        ``unrealized_conversion_cast`` and emitted a bare-d0 indirect
+        map — silently wrong as soon as ``offset_m`` was non-zero.  Spyre
+        kernels always pass index buffers as ``!tt.ptr<i32>`` +
+        ``tt.descriptor_load``, so the fallback was dead code masking a
+        misuse.
+        """
+        with pytest.raises(RuntimeError, match="PassManager::run failed"):
+            self.run("""
+            module {
+              tt.func @k(%ptr: !tt.ptr<f16>,
+                         %x_offsets: tensor<32xi32>,
+                         %y_offset: i32) {
+                %M = arith.constant 1024 : i32
+                %K = arith.constant 128 : i32
+                %stride_row = arith.constant 128 : i64
+                %stride_col = arith.constant 1 : i64
+                %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                    : <f16>, <1x64xf16>
+                %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                    : (!tt.tensordesc<1x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+                tt.return
+              }
+            }
+            """)
+        # MLIR's standard diagnostic for an unconverted illegal op.  If a
+        # future change adds a custom emitOpError ahead of the failure()
+        # return, tighten this substring to match the new wording.
+        self.assert_stderr(capfd,
+                           "failed to legalize operation 'tt.descriptor_gather'")
+
+    def test_gather_block_dim0_not_one_fails(self, capfd):
+        """Block dim-0 != 1 is rejected by DescriptorGatherOp::verify.
+
+        ``<2x64xf16>`` means the block has 2 rows; the verifier requires
+        exactly 1. This is a static property of the descriptor type, so
+        ``DescriptorGatherOp::verify`` fires during ``ir.parse_mlir_module``
+        (MLIR runs op verifiers at parse time), before the pass manager runs.
+        Hence the exception message is "Parse MLIR file failed", not
+        "PassManager::run failed".
+        """
+        with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
+            self.run("""
+            module {
+              tt.func @k(%ptr: !tt.ptr<f16>,
+                         %x_offsets: tensor<32xi32>, %y_offset: i32) {
+                %M = arith.constant 1024 : i32
+                %K = arith.constant 64 : i32
+                %stride_row = arith.constant 64 : i64
+                %stride_col = arith.constant 1 : i64
+                %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                    : <f16>, <2x64xf16>
+                %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                    : (!tt.tensordesc<2x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+                tt.return
+              }
+            }
+            """)
+        self.assert_stderr(capfd, "descriptor block must have exactly 1 row")
+
+    def test_descriptor_from_arg_fails(self, capfd):
+        """Descriptor arriving as a runtime value (block argument, call
+        result, etc.) cannot be lowered.
+
+        Dynamic tensor *shapes* inside a descriptor are fine — they
+        produce `memref<?>` at compile time. What is not supported is a
+        descriptor whose shape/stride info is not visible at compile
+        time because the descriptor itself is a runtime value. The
+        lowering needs the shape and stride constants from
+        `tt.make_tensor_descriptor` to build the memory view and access
+        tile; there is no way to recover them from an opaque descriptor.
+        """
+        with pytest.raises(RuntimeError, match="PassManager::run failed"):
+            self.run("""
+            module {
+              tt.func @k(%desc: !tt.tensordesc<1x64xf16>,  // descriptor as arg — no shape/stride info
+                         %x_offsets: tensor<32xi32>, %y_offset: i32) {
+                %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                    : (!tt.tensordesc<1x64xf16>, tensor<32xi32>, i32) -> tensor<32x64xf16>
+                tt.return
+              }
+            }
+            """)
+        self.assert_stderr(capfd, "cannot lower descriptor op")
+
+
+# =========================================================================
+# tt.descriptor_gather — N-D block (not yet supported, tracking gap)
+# =========================================================================
+
+class TestDescriptorGatherND(LowerDescMemoryTester):
+    # tt.descriptor_gather requires a 2D block type today.  A 3D block
+    # (e.g. <1x16x128xf16>) would express paged-attention style gather:
+    #   BT_v = block_table.reshape(batch * num_pages)   # flat index buffer
+    #   K_cache shape: (max_pages, block_size, dim)
+    #   result = K_cache.gather(BT_v, 0)               # -> (batch*num_pages, block_size, dim)
+    # The verifier rejects this today — tracked here so the gap is visible.
+
+    @pattern("descriptor-gather-nd", category="memory", negative=True, example=[
+        "# NOT supported: descriptor_gather with N-D block (rank > 2)",
+        "# Paged attention pattern — block table drives the indirect dim,",
+        "# remaining dims tile over (block_size, head_dim):",
+        "k_desc = tl.make_tensor_descriptor(k_cache_ptr, [...], block_shape=[1, block_size, dim])",
+        "result = tl.descriptor_gather(k_desc, BT_v, head_offset)",
+        "# → tensor<num_pages x block_size x dim x f16>  (3D result, not yet supported)",
+    ])
+    def test_gather_nd_block_rejected(self, capfd):
+        """3D block type is rejected by verifyGatherScatterOp.
+
+        ``<1x16x128xf16>`` has rank 3; the verifier requires exactly rank 2.
+        This is the gap that prevents paged-attention style N-D gather:
+        the block table lookup could drive the outermost indirect dimension,
+        with the remaining dims iterating over (block_size, head_dim).
+        Caught during ``ir.parse_mlir_module`` (verifier runs at parse time).
+        """
+        with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
+            self.run("""
+            module {
+              tt.func @k(%ptr: !tt.ptr<f16>,
+                         %x_offsets: tensor<32xi32>, %y_offset: i32) {
+                %M = arith.constant 1024 : i32
+                %K = arith.constant 16 : i32
+                %D = arith.constant 128 : i32
+                %stride0 = arith.constant 2048 : i64
+                %stride1 = arith.constant 128 : i64
+                %stride2 = arith.constant 1 : i64
+                %desc = tt.make_tensor_descriptor %ptr, [%M, %K, %D], [%stride0, %stride1, %stride2]
+                    : <f16>, <1x16x128xf16>
+                %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                    : (!tt.tensordesc<1x16x128xf16>, tensor<32xi32>, i32) -> tensor<32x128xf16>
+                tt.return
+              }
+            }
+            """)
+        self.assert_stderr(capfd, "descriptor block must be a 2D tensor")
+
+
+# =========================================================================
+# tt.descriptor_scatter → construct_memory_view + construct_indirect_access_tile + store
+# =========================================================================
+
+class TestDescriptorScatter(LowerDescMemoryTester):
+    # tt.descriptor_scatter → ktdp.store via indirect access tile.
+    # Scatter writes non-contiguous rows — the mirror of gather.
+    # Same size constraint: block must have exactly 1 row; the number of
+    # scattered rows comes from x_offsets, not the block shape.
+    #
+    # Example: a 1024×128 tensor, scattering 32 non-contiguous rows,
+    # writing a 64-wide column slice starting at y_offset:
+    #   %desc = tt.make_tensor_descriptor %ptr, [%M=1024, %K=128], [128, 1]
+    #               : <f16>, <1x64xf16>          // block: 1 row × 64 cols
+    #   tt.descriptor_scatter %desc[%x_offsets, %y_offset], %data
+    #               : ..., tensor<32xi32>, i32, tensor<32x64xf16>
+    #   → memory view covers the full 1024×128 tensor (memref<1024x128xf16>)
+    #   → x_offsets (tensor<32xi32>) names the 32 row indices to write
+    #   → y_offset is the starting column for the 64-wide tile within each row
+    #   → %data shape [32, 64] = [len(x_offsets), block_cols]
+    #
+    # tt.make_tensor_descriptor: shape operands are i32, strides are i64.
+    #
+    # test_scatter_2d[M,K]         — row-scatter, parametrized over (M,K) pairs
+    # test_scatter_structural      — affine attrs and region present
+    # test_multi_descriptor        — two independent descriptors in one function
+
+    @pytest.mark.parametrize("M,K", [(512, 128), (1024, 128), (2048, 256)])
+    def test_scatter_2d(self, M, K):
+        # Row-scatter: x_offsets (tensor<32xi32>) names 32 non-contiguous rows.
+        # y_offset is the starting column for the 64-wide tile within each row.
+        # %data shape [32, 64] = [len(x_offsets), block_cols] is what gets written.
+        #
+        # x_offsets is staged via descriptor_load — same calling convention
+        # as gather (and the only legal provenance after the fallback removal).
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32,              // starting column for the 64-wide tile
+                     %data: tensor<32x64xf16>) {{ // data to scatter
+            %M = arith.constant {M} : i32         // full tensor rows — compile-time
+            %K = arith.constant {K} : i32         // full tensor cols — compile-time
+            %stride_row = arith.constant {K} : i64  // row stride = K (row-major)
+            %stride_col = arith.constant 1 : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1 : i64
+            %c0_i32     = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>               // block: 1 row × 64 cols (scatter constraint)
+            tt.descriptor_scatter %desc[%x_offsets, %y_offset], %data
+                : !tt.tensordesc<1x64xf16>, tensor<32xi32>, i32, tensor<32x64xf16>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_indirect_access_tile", "ktdp.store")
+        self.assert_absent("tt.descriptor_scatter")
+        # No cast: trace path reuses the index descriptor's memory view.
+        self.assert_absent("unrealized_conversion_cast")
+        # Two memory views: index buffer + base table.  Regression to the
+        # fallback would build a third.
+        self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
+        # Base-table memory view: shape [M, K] (assert_result matches by shape=
+        # so it picks the 2-D view, not the 1-D index view of shape [32]).
+        self.assert_result("ktdp.construct_memory_view", shape=[M, K], elem_type="f16")
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+
+    def test_scatter_structural(self):
+        # ktdp.construct_indirect_access_tile carries:
+        #   - a region with per-row subscript affine maps
+        #   - variables_space_set / variables_space_order attrs that describe
+        #     the iteration space over x_offsets
+        # The memory view must cover the full tensor, not just the block row.
+        #
+        # x_offsets is staged via descriptor_load (the only legal provenance
+        # post-fallback-removal); the assertions here pin the *base* table
+        # memory view by shape= so they remain unambiguous despite the second
+        # 1-D index-buffer view that descriptor_load lowering creates.
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32,
+                     %data: tensor<32x64xf16>) {
+            %M = arith.constant 1024 : i32
+            %K = arith.constant 128 : i32         // full tensor cols
+            %stride_row = arith.constant 128 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1 : i64
+            %c0_i32     = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>
+            tt.descriptor_scatter %desc[%x_offsets, %y_offset], %data
+                : !tt.tensordesc<1x64xf16>, tensor<32xi32>, i32, tensor<32x64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_has_region("ktdp.construct_indirect_access_tile")
+        # Full tensor memory view: shape [1024, 128].  assert_result matches by
+        # shape= so it picks the 2-D base view, not the 1-D index view.
+        self.assert_result("ktdp.construct_memory_view", shape=[1024, 128], elem_type="f16")
+        # 2 dims, 0 symbols, 4 constraints describes the base view.  The 1-D
+        # index view has only 2 constraints, so assert_integer_set's "any
+        # match" semantics pick the base view.
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+        # variables_space_set: [0,31]×[0,63] = [len(x_offsets)−1, block_cols−1]
+        self.assert_integer_set("ktdp.construct_indirect_access_tile", "variables_space_set",
+                                num_dims=2, num_symbols=0, num_constraints=4)
+
+    def test_multi_descriptor(self):
+        # Two independent tt.make_tensor_descriptor ops in one function.
+        # Each must produce its own ktdp.construct_memory_view and access tile;
+        # both descriptor ops must be erased after lowering.
+        self.run("""
+        module {
+          tt.func @k(%ptr_a: !tt.ptr<f16>, %ptr_b: !tt.ptr<f16>,
+                     %m: i32, %k: i32) {
+            %M = arith.constant 1024 : i32
+            %K = arith.constant 64 : i32
+            %stride_row = arith.constant 64 : i64
+            %stride_col = arith.constant 1 : i64
+            // Two independent descriptors pointing to different tensors
+            %desc_a = tt.make_tensor_descriptor %ptr_a, [%M, %K],
+                          [%stride_row, %stride_col] : <f16>, <32x64xf16>
+            %desc_b = tt.make_tensor_descriptor %ptr_b, [%M, %K],
+                          [%stride_row, %stride_col] : <f16>, <32x64xf16>
+            %data = tt.descriptor_load %desc_a[%m, %k]
+                : !tt.tensordesc<32x64xf16> -> tensor<32x64xf16>
+            tt.descriptor_store %desc_b[%m, %k], %data
+                : !tt.tensordesc<32x64xf16>, tensor<32x64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_absent("tt.descriptor_load", "tt.descriptor_store",
+                           "tt.make_tensor_descriptor")
+        # One memory view and one access tile per descriptor
+        self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
+        self.assert_count("ktdp.construct_access_tile", 2, cmp="eq")
+
+
+# =========================================================================
+# Descriptor placement: view inherits the descriptor's insertion point.
+# =========================================================================
+
+class TestDescriptorPlacement(LowerDescMemoryTester):
+    """``ktdp.construct_memory_view`` is emitted at the descriptor's site.
+
+    ``LowerDescriptorMemory`` rewrites every ``tt.make_tensor_descriptor``
+    in place — the resulting ``ktdp.construct_memory_view`` lands in
+    the same region as the descriptor it replaces, regardless of where
+    the access op (load / store / gather / scatter) that consumes it
+    lives.  Three cases are covered:
+
+    * **Top-level descriptor.** Descriptor at function top, access op
+      inside ``scf.for`` → view stays at function top.  Built once
+      and reused across every loop iteration.
+
+    * **Nested descriptor.** Descriptor *inside* ``scf.for`` → view
+      is emitted inside the loop body, alongside the access op.
+      Rebuilt once per iteration.  This pass does not try to move
+      the view out of the loop; that is left to the user (or a
+      later optimization pass).
+
+    * **Conditional descriptor.** Descriptor inside an ``scf.if``
+      then-branch → view is emitted inside the same branch, so it
+      is only built when the branch is taken.
+    """
+
+    @pattern("descriptor-placement-top-level", category="memory", example=[
+        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],",
+        "                                 block_shape=[BLOCK])  # at function top",
+        "for off in range(0, N, BLOCK):",
+        "    tile = tl.descriptor_load(desc, [off])  # inside the loop",
+    ])
+    def test_top_level_descriptor_view_outside_loop(self):
+        """Descriptor at function top, load inside ``scf.for`` → view at function top.
+
+        Covers the common case where the user defines a descriptor
+        once at the start of the kernel and then loads tiles from it
+        inside a loop.  Checks that:
+
+        * exactly one ``ktdp.construct_memory_view`` is emitted (not
+          one per loop iteration);
+        * its immediate parent in the IR is ``tt.func``, not
+          ``scf.for`` — i.e. the view sits at function top, so it is
+          built once and reused across every iteration;
+        * the per-tile ops (``ktdp.construct_access_tile``,
+          ``ktdp.load``) do live inside the loop, since they depend
+          on the loop variable.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>) {
+            %N = arith.constant 1024 : i32
+            %stride = arith.constant 1 : i64
+            // Descriptor at function top: view should land at function
+            // top too, so it's built once and reused every iteration.
+            %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                : <f16>, <64xf16>
+
+            %lo = arith.constant 0 : index
+            %hi = arith.constant 1024 : index
+            %step = arith.constant 64 : index
+            scf.for %iv = %lo to %hi step %step {
+              %off = arith.index_cast %iv : index to i32
+              %data = tt.descriptor_load %desc[%off]
+                  : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            }
+            tt.return
+          }
+        }
+        """)
+        # Exactly one view, and it is at function top — not in the loop.
+        self.assert_count("ktdp.construct_memory_view", 1, cmp="eq")
+        self.assert_present("ktdp.construct_memory_view", parent="tt.func")
+        self.assert_count("ktdp.construct_memory_view", 0, cmp="eq",
+                          parent="scf.for")
+        # The access tile is per-iteration (driven by %iv) so it lives
+        # inside the loop, alongside ktdp.load. Pin this so a regression
+        # that hoists the access tile out of the loop also flags here.
+        self.assert_present("ktdp.construct_access_tile", parent="scf.for")
+        self.assert_present("ktdp.load", parent="scf.for")
+
+    @pattern("descriptor-placement-nested", category="memory", example=[
+        "for i in range(0, N, BLOCK):",
+        "    desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],",
+        "                                     block_shape=[BLOCK])  # inside loop",
+        "    tile = tl.descriptor_load(desc, [i])",
+    ])
+    def test_nested_descriptor_view_inside_loop(self):
+        """Descriptor written inside ``scf.for`` is lowered correctly.
+
+        Covers the case where ``tt.make_tensor_descriptor`` appears
+        inside a loop body (instead of at function top).  Checks that:
+
+        * ``tt.make_tensor_descriptor`` and ``tt.descriptor_load`` are
+          both removed from the IR;
+        * the corresponding ``ktdp.construct_memory_view``,
+          ``ktdp.construct_access_tile``, and ``ktdp.load`` are
+          emitted by the pass;
+        * the new ``ktdp.construct_memory_view`` is placed inside the
+          ``scf.for`` body — same region as the descriptor it replaces
+          — and not lifted out to function top.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>) {
+            %N = arith.constant 1024 : i32
+            %stride = arith.constant 1 : i64
+
+            %lo = arith.constant 0 : index
+            %hi = arith.constant 1024 : index
+            %step = arith.constant 64 : index
+            scf.for %iv = %lo to %hi step %step {
+              // Descriptor *inside* the loop: view should land inside too.
+              %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                  : <f16>, <64xf16>
+              %off = arith.index_cast %iv : index to i32
+              %data = tt.descriptor_load %desc[%off]
+                  : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            }
+            tt.return
+          }
+        }
+        """)
+        # Lowering succeeds end-to-end: descriptor erased, ktdp ops emitted.
+        self.assert_absent("tt.make_tensor_descriptor", "tt.descriptor_load")
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_access_tile", "ktdp.load")
+        # The view is inside the loop body, not lifted to the function top.
+        self.assert_present("ktdp.construct_memory_view", parent="scf.for")
+        self.assert_count("ktdp.construct_memory_view", 0, cmp="eq",
+                          parent="tt.func")
+
+    @pattern("descriptor-placement-conditional", category="memory", example=[
+        "if cond:",
+        "    desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],",
+        "                                     block_shape=[BLOCK])  # inside if",
+        "    tile = tl.descriptor_load(desc, [off])",
+    ])
+    def test_descriptor_inside_scf_if_view_inside_branch(self):
+        """Descriptor written inside ``scf.if`` is lowered correctly.
+
+        Covers the case where ``tt.make_tensor_descriptor`` appears
+        inside the then-branch of an ``scf.if`` (instead of at function
+        top).  Checks that:
+
+        * ``tt.make_tensor_descriptor`` and ``tt.descriptor_load`` are
+          both removed from the IR;
+        * the corresponding ``ktdp.construct_memory_view``,
+          ``ktdp.construct_access_tile``, and ``ktdp.load`` are
+          emitted by the pass;
+        * the new ``ktdp.construct_memory_view`` is placed inside the
+          ``scf.if`` branch — same region as the descriptor it
+          replaces — and not lifted out to function top.  Zero
+          ``ktdp.construct_memory_view`` ops are emitted directly under
+          ``tt.func``.
+
+        ``%cond`` is a function argument; the test never binds it to a
+        concrete value because this is a structural check on where the
+        view lands in the IR, not an execution test.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %cond: i1, %off: i32) {
+            %N = arith.constant 1024 : i32
+            %stride = arith.constant 1 : i64
+
+            scf.if %cond {
+              // Descriptor *inside* the then-branch: view should land
+              // inside scf.if too, not at function top.
+              %desc = tt.make_tensor_descriptor %ptr, [%N], [%stride]
+                  : <f16>, <64xf16>
+              %data = tt.descriptor_load %desc[%off]
+                  : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            }
+            tt.return
+          }
+        }
+        """)
+        # Lowering succeeds end-to-end: descriptor erased, ktdp ops emitted.
+        self.assert_absent("tt.make_tensor_descriptor", "tt.descriptor_load")
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_access_tile", "ktdp.load")
+        # The view is inside the conditional branch, not at function top.
+        self.assert_present("ktdp.construct_memory_view", parent="scf.if")
+        self.assert_count("ktdp.construct_memory_view", 0, cmp="eq",
+                          parent="tt.func")
+
+
+# =========================================================================
+# tt.addptr feeding tt.make_tensor_descriptor — NOT YET LOWERED
+# =========================================================================
+
+class TestAddptrIntoDescriptor(LowerDescMemoryTester):
+    """Per-iteration descriptors built from ``ptr + offset``: not yet supported.
+
+    Note: batched matmul itself *does* compile today via 3D descriptors
+    whose base is the raw buffer pointer (``fixtures/matmul/kernel.py::
+    bmm_matmul_kernel``).  The gap here is the *per-batch-offset* idiom
+    where a ``tt.addptr`` result feeds ``tt.make_tensor_descriptor`` —
+    e.g. ``bmm_matmul_kernel_addptr`` which computes
+    ``a_ptr + b_idx * stride_batch`` as the descriptor base. In TTIR this
+    becomes ``tt.addptr`` feeding ``tt.make_tensor_descriptor``.
+
+    Current state: ``LowerDescriptorMemory`` lowers the descriptor ops
+    via ``getBasePtrAsIndex``, which casts the base ``!tt.ptr`` operand
+    to ``index``. The ``tt.addptr`` that computes that base is left
+    intact. When ``ConvertFunctions`` subsequently rewrites function
+    signatures (``!tt.ptr`` args → ``index``), ``tt.addptr``'s operand
+    becomes ``index`` but its verifier still demands ``!tt.ptr`` —
+    verification fails.
+
+    Fix plan: ``LowerDescriptorMemory`` should fold ``tt.addptr`` into
+    the base/offset it passes to ``construct_memory_view`` (or
+    canonicalize the pointer arithmetic to index arithmetic before
+    ``ConvertFunctions`` runs). Once fixed, delete this test in favor
+    of a positive descriptor-with-offset test.
+    """
+
+    def _build_passes(self, pm):
+        # Failure surfaces in ConvertFunctions, not LowerDescriptorMemory —
+        # we need both passes in the pipeline to reproduce it. Mirrors
+        # the two-pass harness used by DistributeWork tests.
+        from triton._C.libtriton import spyre
+        spyre.passes.ttir_to_ktdp.add_lower_descriptor_memory(pm)
+        spyre.passes.ttir_to_ktdp.add_convert_functions(pm)
+
+    @pattern("descriptor-offset-base", category="memory", negative=True, example=[
+        "# NOT supported: tt.addptr result as descriptor base (e.g. batched matmul)",
+        "base = a_ptr + b_idx * stride_batch   # tt.addptr",
+        "desc = tl.make_tensor_descriptor(base, shape=[M, K], strides=[K, 1],",
+        "                                 block_shape=[BLOCK_M, BLOCK_K])",
+    ])
+    def test_addptr_into_descriptor_fails(self, capfd):
+        """`tt.addptr` result feeding `tt.make_tensor_descriptor`.
+
+        When a `tt.addptr` result is the base pointer for a tensor
+        descriptor, `ConvertFunctions` rewrites the `!tt.ptr` argument
+        to `index` before `LowerDescriptorMemory` can fold the pointer
+        arithmetic, and the op's verifier then rejects the now-illegal
+        operand type. This is the underlying reason batched matmul is
+        currently disabled: each batch step wants to offset the base
+        pointer before constructing the descriptor.
+        """
+        with pytest.raises(RuntimeError, match="PassManager::run failed"):
+            self.run("""
+            module {
+              tt.func @k(%a_ptr: !tt.ptr<f32>, %offset: i32) {
+                %c0_i32 = arith.constant 0 : i32
+                %M = arith.constant 1024 : i32
+                %K = arith.constant 64 : i32
+                %stride_row = arith.constant 64 : i64
+                %stride_col = arith.constant 1 : i64
+                // Per-batch base: a_ptr + offset. The !tt.ptr result of
+                // tt.addptr feeds tt.make_tensor_descriptor — this is
+                // the unsupported shape.
+                %base = tt.addptr %a_ptr, %offset : !tt.ptr<f32>, i32
+                %desc = tt.make_tensor_descriptor %base, [%M, %K],
+                            [%stride_row, %stride_col]
+                          : <f32>, <16x16xf32>
+                %data = tt.descriptor_load %desc[%c0_i32, %c0_i32]
+                          : !tt.tensordesc<16x16xf32> -> tensor<16x16xf32>
+                tt.return
+              }
+            }
+            """)
+        # Pin the exact verifier diagnostic: tt.addptr's !tt.ptr operand
+        # was rewritten to index by ConvertFunctions, but the op's
+        # verifier still demands ptr. A drift in the error text or in
+        # which pass raises it will flag here.
+        self.assert_stderr(capfd,
+                           "tt.addptr",
+                           "must be ptr",
+                           "got 'index'")

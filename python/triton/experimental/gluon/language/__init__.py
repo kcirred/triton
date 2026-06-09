@@ -132,6 +132,17 @@ from ._standard import (
     zeros_like,
 )
 
-from . import nvidia
-from . import amd
+# --- START --- added for spyre
+# The nvidia/amd arch submodules are GPU-only and are not shipped in a
+# spyre-only wheel. Guard their import so `import triton` / the compiler's
+# lazy `import ...gluon.language` still succeeds when they are absent.
+try:
+    from . import nvidia
+except ImportError:
+    nvidia = None
+try:
+    from . import amd
+except ImportError:
+    amd = None
+# --- END --- added for spyre
 from . import extra

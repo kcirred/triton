@@ -22,6 +22,10 @@ option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
 option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
 option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
 option(TRITON_OFFLINE_BUILD "Build without downloading dependencies" OFF)
+option(TRITON_BUILD_TTIR_ONLY "Build only TritonIR dialect (skip GPU dialects, conversions, and targets)" OFF)
+if(TRITON_BUILD_TTIR_ONLY)
+  add_compile_definitions(TRITON_BUILD_TTIR_ONLY)
+endif()
 option(TRITON_EXT_ENABLED "Build with default visibility for Triton+LLVM symbol exposure to plugin extensions" OFF)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 set(TRITON_VERSION "" CACHE STRING "Triton version string (passed from setup.py)")
@@ -111,6 +115,7 @@ set_property(
   PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/python/build_helpers.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm-hash.txt"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm-hash-spyre.txt"  # --- added for spyre
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/json-version.txt"
 )
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -129,7 +134,7 @@ execute_process(
 )
 include("${TRITON_THIRD_PARTY_CMAKE_VARS_FILE}")
 
-if(TRITON_BUILD_PYTHON_MODULE)
+if(TRITON_BUILD_PYTHON_MODULE AND NOT TRITON_BUILD_TTIR_ONLY)
   set_property(
     DIRECTORY
     APPEND
@@ -312,6 +317,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
   find_package(Python3 REQUIRED COMPONENTS Development.Module Interpreter)
   find_package(pybind11 CONFIG REQUIRED HINTS "${Python3_SITELIB}")
 
+  if(TRITON_BUILD_TTIR_ONLY)
+    list(REMOVE_ITEM TRITON_CODEGEN_BACKENDS "nvidia" "amd")
+  endif()
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
@@ -319,9 +327,11 @@ if(TRITON_BUILD_PYTHON_MODULE)
   if (TRITON_BUILD_PROTON)
     add_subdirectory(third_party/proton)
   endif()
-  # We always build proton dialect
-  list(APPEND TRITON_PLUGIN_NAMES "proton")
-  add_subdirectory(third_party/proton/Dialect)
+  if(NOT TRITON_BUILD_TTIR_ONLY)
+    # We always build proton dialect
+    list(APPEND TRITON_PLUGIN_NAMES "proton")
+    add_subdirectory(third_party/proton/Dialect)
+  endif()
 
   if (DEFINED TRITON_PLUGIN_DIRS)
     foreach(PLUGIN_DIR ${TRITON_PLUGIN_DIRS})
@@ -346,36 +356,26 @@ if(TRITON_BUILD_PYTHON_MODULE)
     ${triton_libs}
     ${triton_plugins}
 
-    # mlir
-    MLIRNVVMDialect
-    MLIRNVVMToLLVMIRTranslation
-    MLIRGPUToNVVMTransforms
     MLIRIR
     MLIRControlFlowToLLVM
     MLIRPass
     MLIRTransforms
     MLIRLLVMDialect
     MLIRSupport
-    MLIRTargetLLVMIRExport
     MLIRMathToLLVM
-    MLIRROCDLToLLVMIRTranslation
-    MLIRGPUDialect
     MLIRSCFToControlFlow
     MLIRIndexToLLVM
-    MLIRGPUToROCDLTransforms
     MLIRUBToLLVM
-
-    # LLVM
+    MLIRTargetLLVMIRExport
     LLVMPasses
-    LLVMNVPTXCodeGen
-    # LLVMNVPTXAsmPrinter
-    LLVMAMDGPUCodeGen
-    LLVMAMDGPUAsmParser
+    LLVMPlugins
+    LLVMMIRParser
 
     Python3::Module
     pybind11::headers
-
   )
+
+  # Host architecture codegen (needed by llvm.cc InitializeAllTargets)
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
      CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR # macOS arm64
      CMAKE_OSX_ARCHITECTURES MATCHES "arm64")  # also macOS arm64
@@ -397,6 +397,21 @@ if(TRITON_BUILD_PYTHON_MODULE)
     message(FATAL_ERROR "LLVM codegen/ASM parser libs: This HW architecture (${CMAKE_SYSTEM_PROCESSOR}) is not configured in cmake lib dependencies.")
   endif()
 
+  if(NOT TRITON_BUILD_TTIR_ONLY)
+    list(APPEND TRITON_LIBRARIES
+      MLIRNVVMDialect
+      MLIRNVVMToLLVMIRTranslation
+      MLIRGPUToNVVMTransforms
+      MLIRROCDLToLLVMIRTranslation
+      MLIRGPUDialect
+      MLIRGPUToROCDLTransforms
+
+      LLVMNVPTXCodeGen
+      LLVMAMDGPUCodeGen
+      LLVMAMDGPUAsmParser
+    )
+  endif()
+
   # Define triton library
   string(JOIN "," TRITON_BACKENDS_TUPLE ${TRITON_CODEGEN_BACKENDS})
 
@@ -408,15 +423,22 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   set(TRITON_BACKENDS_TUPLE "(${TRITON_BACKENDS_TUPLE})")
   add_compile_definitions(TRITON_BACKENDS_TUPLE=${TRITON_BACKENDS_TUPLE})
-  add_library(triton SHARED ${PYTHON_SRC_PATH}/main.cc
-                  ${PYTHON_SRC_PATH}/ir.cc
-                  ${PYTHON_SRC_PATH}/gluon_ir.cc
-                  ${CMAKE_CURRENT_SOURCE_DIR}/python/triton/experimental/gsan/src/gsan_testing.cc
-                  ${PYTHON_SRC_PATH}/linear_layout.cc
-                  ${PYTHON_SRC_PATH}/passes.cc
-                  ${PYTHON_SRC_PATH}/interpreter.cc
-                  ${PYTHON_SRC_PATH}/llvm.cc
-                  ${PYTHON_SRC_PATH}/specialize.cc)
+  set(TRITON_SRCS
+    ${PYTHON_SRC_PATH}/main.cc
+    ${PYTHON_SRC_PATH}/ir.cc
+    ${PYTHON_SRC_PATH}/passes.cc
+    ${PYTHON_SRC_PATH}/interpreter.cc
+    ${PYTHON_SRC_PATH}/llvm.cc
+    ${PYTHON_SRC_PATH}/specialize.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/python/triton/experimental/gsan/src/gsan_testing.cc
+  )
+  if(NOT TRITON_BUILD_TTIR_ONLY)
+    list(APPEND TRITON_SRCS
+      ${PYTHON_SRC_PATH}/gluon_ir.cc
+      ${PYTHON_SRC_PATH}/linear_layout.cc
+    )
+  endif()
+  add_library(triton SHARED ${TRITON_SRCS})
 
   # Link triton with its dependencies
   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
@@ -456,7 +478,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
     COPYONLY)
 
   # Build plugins when building libtriton since they depend on libtriton.
-  add_subdirectory(examples/plugins)
+  if(NOT TRITON_BUILD_TTIR_ONLY)
+    add_subdirectory(examples/plugins)
+  endif()
 endif()
 
 if (UNIX AND NOT APPLE AND NOT TRITON_EXT_ENABLED)
@@ -484,10 +508,12 @@ endif()
 find_package(Threads REQUIRED)
 
 add_subdirectory(third_party/f2reduce)
-add_subdirectory(bin)
-add_subdirectory(test)
+if(NOT TRITON_BUILD_TTIR_ONLY)
+  add_subdirectory(bin)
+  add_subdirectory(test)
+endif()
 
-if(TRITON_BUILD_UT)
+if(TRITON_BUILD_UT AND NOT TRITON_BUILD_TTIR_ONLY)
   add_subdirectory(unittest)
   # This target runs all the unit tests.
   add_custom_target(check-triton-unit-tests

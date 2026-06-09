@@ -25,7 +25,17 @@ namespace mlir {
 namespace triton {
 
 struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
+  // --- START --- added for spyre: signature differs by LLVM pin.
+  // The spyre/TTIR-only build uses LLVM e9846648 (cmake/llvm-hash-spyre.txt),
+  // where Resource::getName() is non-const virtual; GPU builds use the older
+  // upstream pin (cmake/llvm-hash.txt) where it is `const`. Guard on
+  // TRITON_BUILD_TTIR_ONLY, which is auto-enabled exactly for the spyre path.
+#ifdef TRITON_BUILD_TTIR_ONLY
+  StringRef getName() final { return "<GlobalMemory>"; }
+#else
   StringRef getName() const final { return "<GlobalMemory>"; }
+#endif
+  // --- END --- added for spyre
 };
 
 class DialectInferLayoutInterface

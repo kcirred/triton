@@ -1,3 +1,5 @@
-add_subdirectory(TritonToTritonGPU)
-add_subdirectory(TritonGPUToLLVM)
-add_subdirectory(TritonInstrumentToLLVM)
+if(NOT TRITON_BUILD_TTIR_ONLY)
+  add_subdirectory(TritonToTritonGPU)
+  add_subdirectory(TritonGPUToLLVM)
+  add_subdirectory(TritonInstrumentToLLVM)
+endif()

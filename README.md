@@ -1,317 +1,263 @@
+# Triton-Spyre
 
-| **`Documentation`** | **`Nightly Wheels`** |
-|-------------------- | -------------------- |
-| [![Documentation](https://github.com/triton-lang/triton/actions/workflows/documentation.yml/badge.svg)](https://triton-lang.org/) | [![Wheels](https://github.com/triton-lang/triton/actions/workflows/wheels.yml/badge.svg)](https://github.com/triton-lang/triton/actions/workflows/wheels.yml) |
+Triton-Spyre is a Triton fork that adds an experimental backend for IBM Spyre.
+The backend lowers Triton TTIR into KTIR, so Triton kernels can be used as a
+frontend for the downstream Spyre compiler stack.
 
-# Triton Conference 2025
+The main path under development is:
 
-![Triton Banner](https://github.com/user-attachments/assets/b4b6972a-857c-417f-bf2c-f16f38a358c0)
-
-The 3rd Triton Developer Conference took place on October 21, 2025 at the Microsoft Silicon Valley Campus in Mountain View, California.
-
-### Conference Materials
-
-Conference recordings and materials are now available online:
-
-- **Conference Videos:** [YouTube Playlist](https://www.youtube.com/playlist?list=PLc_vA1r0qoiQqCdWFDUDqI90oY5EjfGuO)
-- **Conference Slides:** [Google Drive Folder](https://drive.google.com/drive/folders/1KB6tD3UM1J0_eUp-F-JSlGrargLBawIr)
-
-For previous conference materials, see:
-- [2024 Conference Materials](docs/meetups/dev_conference_2024.md)
-- [2023 Conference Materials](docs/meetups/dev-meetup-2023.md)
-
-# Triton
-
-This is the development repository of Triton, a language and compiler for writing highly efficient custom Deep-Learning primitives. The aim of Triton is to provide an open-source environment to write fast code at higher productivity than CUDA, but also with higher flexibility than other existing DSLs.
-
-The foundations of this project are described in the following MAPL2019 publication: [Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations](http://www.eecs.harvard.edu/~htk/publication/2019-mapl-tillet-kung-cox.pdf). Please consider citing this work if you use Triton!
-
-The [official documentation](https://triton-lang.org) contains installation instructions and tutorials.  See also these third-party [Triton puzzles](https://github.com/srush/Triton-Puzzles), which can all be run using the Triton interpreter -- no GPU required.
-
-# Quick Installation
-
-You can install the latest stable release of Triton from pip:
-
-```shell
-pip install triton
+```text
+Triton Python kernel -> TTIR -> KTIR -> downstream Spyre compiler stack
 ```
 
-Binary wheels are available for CPython 3.10-3.14.
+This repo is based on upstream [triton-lang/triton](https://github.com/triton-lang/triton).
 
-# Install from source
+## Status
 
-```shell
-git clone https://github.com/triton-lang/triton.git
-cd triton
+The Spyre backend is an early public development path. It is useful for compiler
+development, KTIR validation, and kernel-lowering experiments. It is not yet a
+drop-in replacement for upstream Triton GPU execution.
 
-pip install -r python/requirements.txt # build-time dependencies
-pip install -e .
-```
+Current focus:
 
-Or with a virtualenv:
+- building Triton with only the Spyre backend enabled,
+- lowering selected TTIR patterns to KTIR,
+- validating generated KTIR with both structural and numerical tests,
+- tracking remaining gaps with focused tests and pattern references.
 
-```shell
-git clone https://github.com/triton-lang/triton.git
-cd triton
+Known limitations:
 
-python -m venv .venv --prompt triton
-source .venv/bin/activate
+- local execution and benchmarking are not supported by the Spyre driver,
+- numerical validation through `ktir-cpu` is a work in progress; some lowering
+  patterns are not yet covered and are tracked by focused tests,
+- some fixtures intentionally document unsupported lowering patterns,
+- the KTIR MLIR bindings (`mlir_ktdp`) are built from this repo's
+  `ktir-mlir-frontend` submodule and differ from Triton's own C++ bindings.
 
-pip install -r python/requirements.txt # build-time dependencies
-pip install -e .
-```
+## Repository Layout
 
-# Building with a custom LLVM
+Key Spyre-specific areas:
 
-Triton uses LLVM to generate code for GPUs and CPUs.  Normally, the Triton build
-downloads a prebuilt LLVM, but you can also build and use LLVM from source.
+- `third_party/spyre/backend/`: Triton backend registration, compiler stages,
+  and driver stub.
+- `third_party/spyre/include/` and `third_party/spyre/lib/`: KTIR lowering
+  passes and C++ bindings exposed through Triton.
+- `third_party/spyre/test/`: structural and numerical tests for the Spyre
+  lowering path.
+- `third_party/spyre/test/fixtures/`: Triton kernel fixtures used by the test
+  framework.
+- `third_party/spyre/docs/patterns/`: generated pattern reference for supported
+  and intentionally unsupported lowering cases.
+- `third_party/spyre/ktir-mlir-frontend/`: KTIR MLIR frontend submodule.
 
-LLVM does not have a stable API, so the Triton build will not work at an
-arbitrary LLVM version.
+## Install
 
-For convenience, use the following command to build LLVM and install Triton with the custom LLVM:
+The Spyre backend is the default build target, so a plain `pip install`
+produces a Spyre-only Triton out of the box — no environment variables and no
+GPU toolchains required. Python 3.12 or newer is recommended.
 
-```shell
-make dev-install-llvm
-```
+> **Heads-up: the first build downloads LLVM and may need `GIT_PAT`.** A
+> Spyre-only build resolves LLVM from the `ktir-mlir-frontend` artifact store on
+> first use, which currently requires a GitHub token in the `GIT_PAT`
+> environment variable. If your install fails while fetching LLVM — the error
+> may not say so clearly — `export GIT_PAT=<token>` and retry. See
+> [LLVM Build Dependency](#llvm-build-dependency) for details. Removal of this
+> requirement is tracked in
+> [ktir-mlir-frontend#24](https://github.com/torch-spyre/ktir-mlir-frontend/issues/24).
 
-<details>
-<summary>
-Alternatively, follow these steps to build LLVM from source manually.
-</summary>
+### Install directly from Git
 
-1. Find the version of LLVM that Triton builds against.  Check
-`cmake/llvm-hash.txt` to see the current version. For example, if it says:
-       49af6502c6dcb4a7f7520178bd14df396f78240c.
-
-   This means that the version of Triton you have builds against
-   [LLVM](https://github.com/llvm/llvm-project) 49af6502.
-
-2. `git checkout` LLVM at this revision.  Optionally, make additional
-   modifications to LLVM.
-
-3. [Build LLVM](https://llvm.org/docs/CMake.html).  For example, you might run:
-
-       $ cd $HOME/llvm-project  # your clone of LLVM.
-       $ mkdir build
-       $ cd build
-       $ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON ../llvm -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld;clang" -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU"
-       $ ninja
-
-4. Grab a snack, this will take a while.
-
-5. Build Triton as above, but set the following environment variables:
-
-       # Modify as appropriate to point to your LLVM build.
-       $ export LLVM_BUILD_DIR=$HOME/llvm-project/build
-
-       $ cd <triton install>
-       $ LLVM_INCLUDE_DIRS=$LLVM_BUILD_DIR/include \
-         LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib \
-         LLVM_SYSPATH=$LLVM_BUILD_DIR \
-         pip install -e .
-
-</details>
-
-# Tips for building
-
-- Set `TRITON_BUILD_WITH_CLANG_LLD=true` as an environment variable to use clang
-  and lld.  lld in particular results in faster builds.
-
-- Set `TRITON_BUILD_WITH_CCACHE=true` to build with ccache.
-
-- Set `TRITON_HOME=/some/path` to change the location of the `.triton`
-  directory where Triton's cache is located and downloads are stored
-  during the build. By default, this is the user's home directory. It
-  can be changed anytime.
-
-- If you're running out of memory when building Triton, specify the `MAX_JOBS`
-  environment variable (to the `pip install -e .` command) to limit the
-  number of jobs.
-
-- Pass `--no-build-isolation` to `pip install` to make nop builds faster.
-  Without this, every invocation of `pip install` uses a different symlink to
-  cmake, and this forces ninja to rebuild most of the `.a` files.
-
-- The build system creates a `compile_commands.json` file under the Triton repo
-  directory. This file is used by VSCode IntelliSense and clangd to provide
-  code completion and other features for C++ code.
-
-  If IntelliSense does not work, you can try the following steps:
-
-    - Do a local build. Run command `pip install -e .`.
-    - Get the full path to the `compile_commands.json` file produced by the build:
-      `find ./build -name 'compile_commands.json' | xargs readlink -f`.
-      You might get a full path similar to `/Users/{username}/triton/build/cmake.macosx-11.1-arm64-cpython-3.12/compile_commands.json`.
-    - In VSCode, install the
-      [C/C++
-      extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools),
-      then open the command palette (`Shift + Command + P` on Mac, or `Shift +
-      Ctrl + P` on Windows/Linux) and open `C/C++: Edit Configurations (UI)`.
-    - Open "Advanced Settings" and paste the full path to
-      `compile_commands.json` into the "Compile Commands" textbox.
-
-# Running tests
-
-There currently isn't a turnkey way to run all the Triton tests, but you can
-follow the following recipe:
-
-```shell
-# One-time setup.  Note this will reinstall local Triton because torch
-# overwrites it with the public version.
-$ make dev-install
-
-# To run all tests (requires a GPU)
-$ make test
-
-# Or, to run tests without a gpu
-$ make test-nogpu
-```
-
-# Tips for hacking
-
-For detailed instructions on how to debug Triton's frontend, please refer to this [tutorial](https://triton-lang.org/main/programming-guide/chapter-3/debugging.html). The following includes additional tips for hacking on Triton's backend.
-
-**Configuration knobs**
-
-See [`python/triton/knobs.py`](python/triton/knobs.py) for the full list of configuration knobs. You can set those knobs directly in python or use environment variables to control them. Below are some of the environment variables you can specify (see `knobs.py` for the full list):
-
-- `MLIR_ENABLE_DUMP=1` dumps the IR before every MLIR pass Triton runs, for all
-   kernels. Use `MLIR_ENABLE_DUMP=kernelName` to dump for a specific kernel only.
-  - Triton cache can interfere with the dump. In cases where `MLIR_ENABLE_DUMP=1` does not work, try cleaning your triton cache: `rm -r ~/.triton/cache/*`.
-- `MLIR_DUMP_PATH` specifies where `MLIR_ENABLE_DUMP` will dump to. If unset will dump to stderr.
-- `LLVM_IR_ENABLE_DUMP=1` dumps the IR before every pass run over the LLVM IR.
-- `TRITON_REPRODUCER_PATH=<reproducer_path>` will generate an MLIR reproducer file
-  at `<reproducer_path>` before each MLIR compiler stage. If any of the stages fail,
-  `<reproducer_path>` will be a local MLIR reproducer captured right before the failing pass.
-- `TRITON_INTERPRET=1` uses the Triton interpreter instead of running on the
-  GPU.  You can insert Python breakpoints in your kernel code!
-- `TRITON_ENABLE_LLVM_DEBUG=1` passes `-debug` to LLVM, printing a lot of
-  debugging information to stdout.  If this is too noisy, run with just
-  `TRITON_LLVM_DEBUG_ONLY` instead to limit the output.
-  - An alternative way to reduce output noisiness is running with
-  `LLVM_IR_ENABLE_DUMP=1`, extract the IR before the LLVM pass of interest, and
-  then run LLVM's `opt` standalone, perhaps passing `-debug-only=foo` on the
-  command line.
-
-- `TRITON_LLVM_DEBUG_ONLY=<comma-separated>` is the equivalent of LLVM's
-  `-debug-only` command-line option. This limits the LLVM debug output to
-  specific pass or component names (which are specified using `#define
-  DEBUG_TYPE` throughout LLVM and Triton) in order to allow the debug output to
-  be less noisy. `TRITON_LLVM_DEBUG_ONLY` allows for one or more comma
-  separated values to be specified (eg
-  `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions"` or
-  `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions,regalloc"`).
-- `TRITON_ENABLE_ASAN=1` invokes the LLVM address sanitizer for
-  memory leak and out of bounds access detection. Currently only supported on the AMD
-  backend. This must be run using the ASAN libraries documented [here](https://rocm.docs.amd.com/projects/llvm-project/en/latest/conceptual/using-gpu-sanitizer.html).
-  - When enabling the address sanitizer it is recommended to disable various memory caching strategies
-  both within the ROCm stack and PyTorch. This will give the address sanitizer the best chance at finding the
-  memory fault where it originates. See this [test](https://github.com/triton-lang/triton/blob/main/third_party/amd/python/test/test_address_sanitizer.py) for more details.
-
-- `USE_IR_LOC={ttir,ttgir}` reparses the IR such that the location information
-  will be the line number of the IR file with that particular extension,
-  instead of line number of the python file. This can provide a direct mapping
-  from the IR to llir/ptx. When used with performance tools, it can provide a
-  breakdown on IR instructions.
-- `TRITON_PRINT_AUTOTUNING=1` prints out the best autotuning config and total time
-  spent for each kernel after autotuning is complete.
-- `DISABLE_LLVM_OPT` will disable llvm optimizations for make_llir and make_ptx
-  if its value is true when parsing as Bool. Otherwise, it will be parsed as a list
-  of flags to disable llvm optimizations. One usage case is
-  `DISABLE_LLVM_OPT="disable-lsr"`
-  Loop strength reduction is known to cause up to 10% performance changes for
-  certain kernels with register pressure.
-- `TRITON_ALWAYS_COMPILE=1` forces to compile kernels regardless of cache hit.
-- `MLIR_ENABLE_TIMING` dumps the timing information for each MLIR pass.
-- `LLVM_ENABLE_TIMING` dumps the timing information for each LLVM pass.
-- `TRITON_DEFAULT_FP_FUSION` overrides the default behavior of allowing fp fusion (mul+add->fma).
-- `MLIR_ENABLE_DIAGNOSTICS=<comma-separated>` controls diagnostic emission in MLIR.
-  Options are: `warnings`, `remarks`, `stacktraces`, `operations`.
-  Use comma-separated values to customize output. For example,
-  `MLIR_ENABLE_DIAGNOSTICS=remarks,operations` enables remarks and IR operations,
-  while `MLIR_ENABLE_DIAGNOSTICS=warnings,stacktraces` enables warnings with
-  stacktraces. By default, only errors are shown. Setting `warnings` includes
-  errors and warnings; `remarks` includes errors, warnings, and remarks.
-- `MLIR_ENABLE_REMARK` is deprecated. Please use `MLIR_ENABLE_DIAGNOSTICS=remarks`.
-- `TRITON_KERNEL_DUMP` enables the dumping of the IR from each compilation stage and the final ptx/amdgcn.
-- `TRITON_DUMP_DIR` specifies the directory to save the dumped IR and ptx/amdgcn when `TRITON_KERNEL_DUMP` is set to 1.
-- `TRITON_KERNEL_OVERRIDE` enables the override of the compiled kernel with a user-specified IR/ptx/amdgcn at the beginning of each compilation stage.
-- `TRITON_OVERRIDE_DIR` specifies the directory from which to load the IR/ptx/amdgcn files when `TRITON_KERNEL_OVERRIDE` is set to 1.
-- `TRITON_F32_DEFAULT` sets the default input precision of `tl.dot` when using 32-bit floats, which can be either `ieee`, `tf32`, or `tf32x3`.
-- `TRITON_FRONT_END_DEBUGGING=1` disables exception wrapping when an error occurs in the compiler frontend, allowing the full stack trace to be seen.
-- `TRITON_DISABLE_LINE_INFO=1` removes all line information from the module.
-- `PTXAS_OPTIONS` passes additional command-line options to the PTX assembler `ptxas` (only on NVIDIA).
-- `LLVM_EXTRACT_DI_LOCAL_VARIABLES` emit full debug info, allowing for eval of values in gpu debuggers (ie cuda-gdb, rocm-gdb etc)
-- `TRITON_DEFAULT_BACKEND=<backend>` optionally sets the default backend used by Triton when
-  constructing the active driver (i.e., `triton.runtime.driver.active`).
-
-> [!NOTE]
-> Some of these environment variables don't have a knob in `knobs.py`-- those are only relevant to the C++ layer(s), hence they don't exist in the python layer.
-
-**Kernel Override Steps**
+The simplest path. `uv` fetches the repository (submodule included) and builds
+it; no manual clone is needed. Use it editable or not:
 
 ```bash
-export TRITON_ALWAYS_COMPILE=1
-export TRITON_KERNEL_DUMP=1
-export TRITON_DUMP_DIR=<dump_dir>
-export TRITON_KERNEL_OVERRIDE=1
-export TRITON_OVERRIDE_DIR=<override_dir>
-# Step 1: Run the kernel once to dump kernel's IRs and ptx/amdgcn in $TRITON_DUMP_DIR
-# Step 2: Copy $TRITON_DUMP_DIR/<kernel_hash> to $TRITON_OVERRIDE_DIR
-# Step 3: Delete the stages that you do not want to override and modify the stage you do want to override
-# Step 4: Run the kernel again to see the overridden result
+# Non-editable
+uv pip install "triton[spyre-test] @ git+https://github.com/torch-spyre/triton.git"
+
+# Editable (uv keeps the checkout under its source tree)
+uv pip install -e "git+https://github.com/torch-spyre/triton.git#egg=triton[spyre-test]"
 ```
 
-**Compiler Pipeline Inspection Steps**
-To introspect the pipeline `add_stages`, before running your kernels, simply set
-the add_stages_inspection_hook like so:
+### Install from a Git checkout
 
-```python
-def inspect_stages(_self, stages, options, language, capability):
-    # inspect or modify add_stages here
-triton.knobs.runtime.add_stages_inspection_hook = inspect_stages
+Recommended for development, since submodule and native-build issues are easier
+to inspect and debug from a local clone:
+
+```bash
+git clone --recurse-submodules https://github.com/torch-spyre/triton.git
+cd triton
+
+uv venv .venv --python 3.12 --python-preference managed --seed
+export UV_PROJECT_ENVIRONMENT=.venv
+
+uv pip install -e ".[spyre-test]"
 ```
-Examples of how to use this for out of tree plugin passes is [here](lib/Plugins/README.md)
-# Changelog
 
-Version 2.0 is out! New features include:
+Setting `UV_PROJECT_ENVIRONMENT` lets every `uv` command target the venv
+without activating it; export it in your shell rc to make it persistent.
+Activating the venv (`source .venv/bin/activate`) instead works too.
 
-- Many, many bug fixes
-- Performance improvements
-- Backend rewritten to use MLIR
-- Support for kernels that contain back-to-back matmuls (e.g., flash attention)
+If the repository was cloned without submodules, the install step initializes
+the required Spyre submodule for you. Initializing it explicitly makes any
+submodule or native-build failure easier to diagnose:
 
-# Contributing
+```bash
+git submodule update --init --recursive
+```
 
-Community contributions are more than welcome, whether it be to fix bugs or to add new features at [github](https://github.com/triton-lang/triton/). For more detailed instructions, please visit our [contributor's guide](CONTRIBUTING.md).
+### Backend selection
 
-# Compatibility
+The Spyre backend is built on its own; it is not combined with the GPU
+backends in a single build. To build the inherited upstream GPU backends
+instead, set `TRITON_BACKENDS` explicitly (e.g. `TRITON_BACKENDS=nvidia` or
+`TRITON_BACKENDS=nvidia,amd`); see the build-variable table below.
 
-Supported Platforms:
+The default Spyre-only install:
 
-- Linux
+1. builds only the Spyre backend (the default when `TRITON_BACKENDS` is unset),
+2. auto-enables `TRITON_BUILD_TTIR_ONLY=ON`,
+3. auto-disables `TRITON_BUILD_PROTON`,
+4. initializes the KTIR MLIR frontend submodule,
+5. resolves LLVM from the frontend's artifact store (see Pre-Downloading below),
+6. builds Triton's C++ extension with the Spyre bindings,
+7. installs the local `triton` Python package,
+8. installs test dependencies when `[spyre-test]` is requested.
 
-Supported Hardware:
+## Faster Rebuilds
 
-- NVIDIA GPUs (Compute Capability 8.0+)
-- AMD GPUs (ROCm 6.2+)
-- Under development: CPUs
+For iterative development, install the build dependencies into the venv once
+and use `--no-build-isolation`. This avoids rebuilding in a throwaway
+environment and makes incremental rebuilds faster and more predictable.
 
-# Development Container (Dev Container)
+```bash
+uv pip install $(uv run python -c "import tomllib; print(' '.join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))")
+uv pip install -e ".[spyre-test]" --no-build-isolation
+```
 
-**Dev Containers** for the Triton project are available from
-the [triton-dev-containers repository](https://github.com/redhat-et/triton-dev-containers).
+Common build variables:
 
-### Key Benefits:
-- **Consistency**: All developers can work with the same development
-  environment, ensuring uniform behavior across different systems.
-- **Isolation**: The container prevents potential conflicts with software
-  installed on your local machine.
-- **Portability**: Easily share the development environment with team members,
-  minimizing onboarding time and setup issues.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TRITON_BACKENDS` | `spyre` | Backend(s) to build. Spyre builds on its own; set to `nvidia` / `amd` (or `nvidia,amd`) for the inherited GPU backends instead. |
+| `TRITON_BUILD_TTIR_ONLY` | auto `ON` when no GPU backends are built | Skip GPU dialects for faster compiler-only builds. |
+| `TRITON_BUILD_PROTON` | auto `OFF` when no GPU backends are built | Skip the profiler when it is not needed. |
+| `MAX_JOBS` | `2 * cpu_count` | Limit parallel compilation jobs. |
+| `TRITON_BUILD_WITH_CCACHE` | `ON` when ccache is available | Enable or disable ccache. |
 
-### How to Use the Dev Container:
+## Tests
 
-For detailed instructions on how to use the dev containers, please see
-the [dev container user guide](https://github.com/redhat-et/triton-dev-containers/blob/main/.devcontainer/devcontainer.md).
+Run the full Spyre validation suite with:
+
+```bash
+uv run pytest third_party/spyre/test -s --tb=short
+```
+
+The suite contains both structural lowering tests and numerical checks through
+`ktir-cpu`. Numerical coverage is a work in progress; a few lowering patterns
+are not yet supported and are tracked by focused tests. To run only the
+structural lowering tests:
+
+```bash
+uv run pytest third_party/spyre/test -s --tb=short -k "not numerical"
+```
+
+Useful narrower commands:
+
+```bash
+uv run pytest third_party/spyre/test/test_lower_desc_memory.py -s --tb=short
+uv run pytest third_party/spyre/test/test_lower_compute_ops.py -s --tb=short
+uv run pytest third_party/spyre/test/test_distribute_work.py -s --tb=short
+uv run pytest third_party/spyre/test/test_ktir_examples.py -s --tb=short
+```
+
+## KTIR CPU Dependency
+
+The optional `spyre-test` extra installs `ktir-cpu` from
+`torch-spyre/ktir-cpu@main`. It provides the numerical interpreter used by the
+Spyre test suite. Treat it as a development dependency rather than part of a
+stable user-facing package contract.
+
+It is installed **without** its `[mlir-frontend]` extra on purpose: that extra
+would pin the `ktir-mlir-frontend` to `ktir-cpu`'s own commit, which differs
+from this repo's `third_party/spyre/ktir-mlir-frontend` submodule. The
+numerical tests need the `mlir_ktdp` bindings (`MLIRFrontendParser`) built from
+*our* submodule so they match the lowering under test — see the parser note in
+`third_party/spyre/test/conftest.py`.
+
+## LLVM Build Dependency
+
+A Spyre-only build does not use upstream Triton's prebuilt LLVM blob. Instead,
+`setup.py` resolves LLVM from the `ktir-mlir-frontend`'s artifact store by
+running `third_party/spyre/ktir-mlir-frontend/scripts/setup_mlir.py`, which
+reads the pinned hash from `cmake/llvm-hash-spyre.txt` and fetches the matching
+build from `torch-spyre/ktir-mlir-frontend`. The resolved path is passed to
+CMake as `LLVM_SYSPATH`.
+
+> **First download requires a token.** Fetching the LLVM artifact for the first
+> time currently needs a GitHub token in `GIT_PAT`. Removing this requirement is
+> considered in
+> [ktir-mlir-frontend#24](https://github.com/torch-spyre/ktir-mlir-frontend/issues/24).
+
+To point the build at a prebuilt LLVM and skip this step entirely, set
+`LLVM_SYSPATH` yourself — `setup.py` only runs `setup_mlir.py` when
+`LLVM_SYSPATH` is unset:
+
+```bash
+export LLVM_SYSPATH=/path/to/llvm
+```
+
+The pinned LLVM hash lives in `cmake/llvm-hash-spyre.txt`.
+
+To point the build at a prebuilt nlohmann/json include tree, set `JSON_SYSPATH`
+(inherited from upstream Triton):
+
+```bash
+export JSON_SYSPATH=/path/to/json/include
+```
+
+Note: upstream's `TRITON_OFFLINE_BUILD` does **not** make a Spyre build fully
+offline — `setup_mlir.py` resolves LLVM from the `ktir-mlir-frontend` artifact
+store independently of that flag. To build without network access, pre-place
+LLVM and set `LLVM_SYSPATH` (and `JSON_SYSPATH`) yourself.
+
+## Upstream Triton Changes
+
+Most Spyre-specific additions live under `third_party/spyre/`. A small number
+of upstream Triton files are modified to make the in-tree Spyre backend build
+cleanly. These changes are guarded so the inherited NVIDIA and AMD GPU paths
+keep building unchanged when those backends are selected.
+
+Search for these markers when rebasing or auditing local changes:
+
+```text
+# --- START --- added for spyre
+# --- END --- added for spyre
+# --- added for spyre
+```
+
+Current upstream-file touch points include:
+
+| File | Spyre-specific change |
+| --- | --- |
+| `setup.py` | Default `TRITON_BACKENDS` to `spyre`; auto TTIR-only / Proton defaults; resolve LLVM via `setup_mlir.py`; Spyre-only package discovery; `spyre-test` extra. |
+| `CMakeLists.txt` | Guard GPU dialect / blob logic behind the TTIR-only build. |
+| `python/src/main.cc` | Register empty `gluon_ir` / `linear_layout` pybind modules so `import triton` works in TTIR-only builds. |
+| `python/triton/experimental/gluon/__init__.py`, `.../language/__init__.py` | Guard GPU-only arch shim imports absent from a Spyre-only wheel. |
+| `include/triton/Dialect/Triton/IR/Dialect.h`, `lib/Target/LLVMIR/LLVMDIUtils.cpp` | Source compatibility with the Spyre LLVM pin (`cmake/llvm-hash-spyre.txt`). |
+
+## Related Documentation
+
+- `third_party/spyre/docs/patterns/index.md`: generated KTIR lowering pattern
+  reference.
+- `third_party/spyre/docs/ttir_only_build.md`: details of the TTIR-only build
+  mode used by Spyre-only builds.
+- `third_party/spyre/test/fixtures/README.md`: fixture framework for kernel
+  examples and per-variant expectations.
+- `third_party/spyre/ktir-mlir-frontend/README.md`: KTIR MLIR frontend
+  submodule documentation.
+
+## License
+
+This fork retains Triton's MIT license at the repository root. The KTIR MLIR
+frontend submodule has its own Apache-2.0 license. See the license files in the
+root repository and submodule for details.

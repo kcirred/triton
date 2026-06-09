@@ -42,9 +42,11 @@ void init_triton_llvm(pybind11::module &&m);
 void init_triton_interpreter(pybind11::module &&m);
 void init_triton_passes(pybind11::module &&m);
 void init_triton_stacktrace_hook(pybind11::module &m);
+#ifndef TRITON_BUILD_TTIR_ONLY
 void init_gluon_ir(pybind11::module &&m);
-void init_gsan_testing(pybind11::module &&m);
 void init_linear_layout(pybind11::module &&m);
+#endif
+void init_gsan_testing(pybind11::module &&m);
 void init_native_specialize(pybind11::module &m);
 FOR_EACH_P(DECLARE_BACKEND, TRITON_BACKENDS_TUPLE)
 
@@ -58,7 +60,25 @@ PYBIND11_MODULE(libtriton, m) {
   init_triton_interpreter(m.def_submodule("interpreter"));
   init_triton_llvm(m.def_submodule("llvm"));
   init_gsan_testing(m.def_submodule("gsan_testing"));
+#ifndef TRITON_BUILD_TTIR_ONLY
   init_linear_layout(m.def_submodule("linear_layout"));
   init_gluon_ir(m.def_submodule("gluon_ir"));
+#else
+  // --- START --- added for spyre
+  // TTIR-only builds (e.g. TRITON_BACKENDS=spyre) skip the gluon_ir /
+  // linear_layout C++ symbols, but Triton's Python import chain still does
+  // `from triton._C.libtriton import gluon_ir` (and `from ... import
+  // GluonOpBuilder, ...`) transitively from gluon experimental modules.
+  // Register empty submodules with a PEP-562 `__getattr__` that returns
+  // `None` for any name, so both the module-level import and downstream
+  // `from gluon_ir import X` resolve without a Python-side stub.
+  auto stub_getattr = py::cpp_function(
+      [](const std::string &) -> py::object { return py::none(); });
+  auto gluon_ir_stub = m.def_submodule("gluon_ir");
+  gluon_ir_stub.attr("__getattr__") = stub_getattr;
+  auto linear_layout_stub = m.def_submodule("linear_layout");
+  linear_layout_stub.attr("__getattr__") = stub_getattr;
+  // --- END --- added for spyre
+#endif
   FOR_EACH_P(INIT_BACKEND, TRITON_BACKENDS_TUPLE)
 }

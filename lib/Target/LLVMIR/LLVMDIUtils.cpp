@@ -66,12 +66,27 @@ LLVM::DITypeAttr LLVMDIUtils::convertPtrType(MLIRContext *context,
 
   unsigned sizeInBits = datalayout.getTypeSizeInBits(pointerType);
   LLVM::DITypeAttr diElTypeAttr = convertType(context, pointeeType);
+  // --- START --- added for spyre: DIDerivedTypeAttr::get() arg count differs
+  // by LLVM pin. The spyre/TTIR-only build uses LLVM e9846648
+  // (cmake/llvm-hash-spyre.txt), which dropped file/line/scope/diflags (9
+  // args). GPU builds use the older upstream pin (cmake/llvm-hash.txt) with
+  // the original 13-arg form. Guard on TRITON_BUILD_TTIR_ONLY, which is
+  // auto-enabled exactly for the spyre path.
+#ifdef TRITON_BUILD_TTIR_ONLY
+  LLVM::DITypeAttr diTypeAttr = mlir::LLVM::DIDerivedTypeAttr::get(
+      context, llvm::dwarf::DW_TAG_pointer_type,
+      mlir::StringAttr::get(context, "pointer"), diElTypeAttr, sizeInBits,
+      /*alignInBits=*/0, /*offsetInBits=*/0, addrSpace,
+      /*extraData=*/nullptr);
+#else
   LLVM::DITypeAttr diTypeAttr = mlir::LLVM::DIDerivedTypeAttr::get(
       context, llvm::dwarf::DW_TAG_pointer_type,
       mlir::StringAttr::get(context, "pointer"), /*file=*/nullptr, /*line=*/0,
       /*scope=*/nullptr, diElTypeAttr, sizeInBits, /*alignInBits=*/0,
       /*offset=*/0, addrSpace, mlir::LLVM::DIFlags::Zero,
       /*extra data=*/nullptr);
+#endif
+  // --- END --- added for spyre
   return diTypeAttr;
 }
 

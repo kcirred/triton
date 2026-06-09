@@ -68,7 +68,8 @@ class BackendInstaller:
 
             if is_git_repo():
                 try:
-                    subprocess.run(["git", "submodule", "update", "--init", f"{backend_name}"], check=True,
+                    subprocess.run(["git", "submodule", "update", "--init", "--recursive",  # --- added for spyre: --recursive
+                                    f"{backend_name}"], check=True,
                                    stdout=subprocess.DEVNULL, cwd=root_dir)
                 except subprocess.CalledProcessError:
                     pass
@@ -188,6 +189,55 @@ def update_symlink(link_path, source_path):
 # ---- cmake extension ----
 
 
+# --- START --- added for spyre
+# Wheel slimming for spyre-only builds: what ships and what doesn't.
+#
+# Upstream Triton's `python/triton/` tree carries GPU-arch Python that a
+# spyre-only build has no use for. We split it into two tiers:
+#
+#   KEPT — the gluon *base* (experimental/gluon/{_runtime,_compiler}.py and
+#     experimental/gluon/language/{_core,_layouts,_math,_semantic,_standard}.py,
+#     ~10 files). This is NOT optional: triton/compiler/code_generator.py
+#     imports `from ..experimental.gluon import language as ttgl` at class-body
+#     scope (~line 1614) on EVERY compile — gluon or not — to register
+#     ttgl.static_assert / static_print in its dispatch table. Dropping the base
+#     would break `make_ir`, so it stays in the spyre wheel.
+#
+#   EXCLUDED — the GPU-*arch* leaves (~40 files, ~580K): the nvidia/amd arch
+#     code under gluon/language/{nvidia,amd}/** (blackwell, hopper, ampere,
+#     gfx1250, cdna*, rdna*), the gluon/{nvidia,amd} shims, and
+#     tools/triton_to_gluon_translator. None are reachable on the spyre compile
+#     path. They are removed three ways, all guarded by `_has_gpu_backend`
+#     (a GPU build ships everything, unchanged):
+#       1. get_packages() passes them to find_packages(exclude=...) so they are
+#          not declared packages.
+#       2. CMakeBuildPy.find_data_files() drops them from the recursive
+#          include_package_data glob (an excluded child still lives physically
+#          under a kept parent package's dir, so setuptools would otherwise copy
+#          it as the parent's data — _EXCLUDED_GPU_PATH_SEGMENTS catches that).
+#       3. add_link_to_backends() prunes stale inactive-backend symlinks.
+#     The absence of the leaves is made safe at runtime by try/except guards in
+#     experimental/gluon/__init__.py and experimental/gluon/language/__init__.py
+#     (the `from . import nvidia/amd` lines resolve to None when absent).
+#
+# Path segments (below) are matched against data files returned by
+# build_py.find_data_files; keep this list in sync with the get_packages()
+# exclude globs.
+_EXCLUDED_GPU_PATH_SEGMENTS = (
+    os.path.join("experimental", "gluon", "language", "nvidia"),
+    os.path.join("experimental", "gluon", "language", "amd"),
+    os.path.join("experimental", "gluon", "nvidia"),
+    os.path.join("experimental", "gluon", "amd"),
+    os.path.join("tools", "triton_to_gluon_translator"),
+)
+
+
+def _is_excluded_gpu_path(path):
+    norm = os.path.normpath(path)
+    return any(seg in norm for seg in _EXCLUDED_GPU_PATH_SEGMENTS)
+# --- END --- added for spyre
+
+
 class CMakeClean(clean):
 
     def initialize_options(self):
@@ -200,6 +250,24 @@ class CMakeBuildPy(build_py):
     def run(self) -> None:
         self.run_command('build_ext')
         return super().run()
+
+    # --- START --- added for spyre
+    def find_data_files(self, package, src_dir):
+        """Filter out GPU-arch package data on a spyre-only build.
+
+        ``include_package_data=True`` makes setuptools recursively glob each
+        included package's directory for data files. The GPU-arch Python trees
+        (``experimental/gluon/language/{nvidia,amd}/**``, the translator) live
+        physically *under* included parent packages, so they get swept into the
+        wheel as the parent's data even though ``get_packages()`` excludes them
+        from ``packages=``. Dropping them here keeps the spyre wheel free of
+        unused GPU code. GPU builds (``_has_gpu_backend``) are unaffected.
+        """
+        files = super().find_data_files(package, src_dir)
+        if _has_gpu_backend:
+            return files
+        return [f for f in files if not _is_excluded_gpu_path(f)]
+    # --- END --- added for spyre
 
 
 class CMakeExtension(Extension):
@@ -334,6 +402,7 @@ class CMakeBuild(build_ext):
         # environment variables we will pass through to cmake
         passthrough_args = [
             "TRITON_BUILD_PROTON",
+            "TRITON_BUILD_TTIR_ONLY",  # --- added for spyre
             "TRITON_BUILD_WITH_CCACHE",
             "TRITON_PARALLEL_LINK_JOBS",
             "TRITON_OFFLINE_BUILD",
@@ -350,6 +419,30 @@ class CMakeBuild(build_ext):
             "TRITON_PTXAS_PATH",
             "TRITON_PTXAS_BLACKWELL_PATH",
         ]
+        # --- START --- added for spyre
+        # When building the spyre backend without GPU backends, resolve LLVM
+        # from the ktir-mlir-frontend's artifact store via setup_mlir.py instead
+        # of the oaitriton blob. setup_mlir.py reads llvm-hash-spyre.txt.
+        # Must run before the passthrough_args evaluation below so that
+        # LLVM_SYSPATH is in os.environ when it's checked.  # --- added for spyre
+        if not _has_gpu_backend and "spyre" in _active_backends and "LLVM_SYSPATH" not in os.environ:
+            _frontend_dir = os.path.join(get_base_dir(), "third_party", "spyre", "ktir-mlir-frontend")
+            _setup_mlir = os.path.join(_frontend_dir, "scripts", "setup_mlir.py")
+            _hash_file = os.path.join(get_base_dir(), "cmake", "llvm-hash-spyre.txt")
+            if os.path.isfile(_setup_mlir) and os.path.isfile(_hash_file):
+                with open(_hash_file) as _f:
+                    _llvm_hash = _f.read().strip()
+                _mlir_dir = subprocess.check_output(
+                    [sys.executable, _setup_mlir, "--hash", _llvm_hash, "--repo", "torch-spyre/ktir-mlir-frontend"],
+                    cwd=_frontend_dir,
+                    text=True,
+                ).strip()
+                if _mlir_dir:
+                    # MLIR_DIR is <root>/lib/cmake/mlir; LLVM_SYSPATH is <root>.
+                    _mlir_root = str(Path(_mlir_dir).parents[2])
+                    os.environ["LLVM_SYSPATH"] = _mlir_root
+        # --- END --- added for spyre
+
         cmake_args += [f"-D{option}={os.getenv(option)}" for option in passthrough_args if option in os.environ]
 
         if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
@@ -371,7 +464,34 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+# --- START --- added for spyre
+# This fork ships the Spyre backend as the primary target. Default to a
+# Spyre-only build so `pip install .` (with no env vars set) produces a
+# working Triton-Spyre install instead of a heavyweight 3-backend build
+# that needs CUDA/ROCm toolchains. Override with TRITON_BACKENDS=... to
+# build any subset of {nvidia, amd, spyre}.
+_ALL_IN_TREE_BACKENDS = ["nvidia", "amd", "spyre"]
+_DEFAULT_BACKENDS = ["spyre"]
+_backends_env = os.environ.get("TRITON_BACKENDS")
+if _backends_env is not None:
+    _active_backends = [b.strip() for b in _backends_env.split(",") if b.strip()]
+    for _b in _active_backends:
+        if _b not in _ALL_IN_TREE_BACKENDS:
+            raise ValueError(f"TRITON_BACKENDS: unknown backend '{_b}'. Available: {_ALL_IN_TREE_BACKENDS}")
+else:
+    _active_backends = _DEFAULT_BACKENDS
+
+_GPU_BACKENDS = {"nvidia", "amd"}
+_has_gpu_backend = bool(set(_active_backends) & _GPU_BACKENDS)
+
+if not _has_gpu_backend and "TRITON_BUILD_TTIR_ONLY" not in os.environ:
+    os.environ["TRITON_BUILD_TTIR_ONLY"] = "ON"
+
+if not _has_gpu_backend and "TRITON_BUILD_PROTON" not in os.environ:
+    os.environ["TRITON_BUILD_PROTON"] = "OFF"
+# --- END --- added for spyre
+
+backends = [*BackendInstaller.copy(_active_backends), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
@@ -402,7 +522,37 @@ def get_package_dirs():
 
 
 def get_packages():
-    yield from find_packages(where="python")
+    # --- START --- added for spyre
+    # A spyre-only build never uses the GPU-arch Python trees that ship in
+    # upstream Triton's source (gluon nvidia/amd arch leaves + the
+    # triton_to_gluon_translator). They are not imported by `import triton`
+    # nor by the spyre backend/tests, so exclude them from find_packages to
+    # keep them out of the wheel. A build that includes a GPU backend keeps
+    # them (no exclude).
+    if _has_gpu_backend:
+        discovered = find_packages(where="python")
+    else:
+        # Exclude the GPU-arch Python trees AND any stale inactive-backend
+        # symlink dirs (backends/{nvidia,amd}, language|tools/extra/{cuda,hip})
+        # so discovery never records a package whose dir add_link_to_backends
+        # later prunes — which would make build_py fail with "package directory
+        # does not exist". The active spyre backend package is yielded
+        # explicitly below.
+        discovered = find_packages(where="python", exclude=[
+            "triton.experimental.gluon.language.nvidia*",
+            "triton.experimental.gluon.language.amd*",
+            "triton.experimental.gluon.nvidia*",
+            "triton.experimental.gluon.amd*",
+            "triton.tools.triton_to_gluon_translator*",
+            "triton.backends.nvidia*",
+            "triton.backends.amd*",
+            "triton.language.extra.cuda*",
+            "triton.language.extra.hip*",
+            "triton.tools.extra.cuda*",
+            "triton.tools.extra.hip*",
+        ])
+    yield from discovered
+    # --- END --- added for spyre
 
     for backend in backends:
         yield f"triton.backends.{backend.name}"
@@ -448,6 +598,28 @@ def add_link_to_backends(external_only):
                 src_dir = os.path.join(backend.tools_dir, x)
                 install_dir = os.path.join(extra_dir, x)
                 update_symlink(install_dir, src_dir)
+
+    # --- START --- added for spyre
+    # Prune symlinks left behind by a previous build of an in-tree GPU backend
+    # that is no longer active. add_link_to_backends only *creates* links for
+    # active backends; without pruning, a stale `backends/nvidia`,
+    # `language/extra/cuda`, etc. lingers and gets swept into the wheel by
+    # find_packages (emitting "package would be ignored" warnings). Only
+    # symlinks are unlinked — a real GPU build's directories are untouched.
+    triton_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "python", "triton"))
+    # in-tree GPU backend -> (language/extra link name, tools/extra link name)
+    _gpu_extra_link_names = {"nvidia": "cuda", "amd": "hip"}
+    for _inactive in set(_GPU_BACKENDS) - set(_active_backends):
+        _stale_links = [
+            os.path.join(triton_root, "backends", _inactive),
+            os.path.join(triton_root, "language", "extra", _gpu_extra_link_names[_inactive]),
+            os.path.join(triton_root, "tools", "extra", _gpu_extra_link_names[_inactive]),
+        ]
+        for _link in _stale_links:
+            if os.path.islink(_link):
+                print(f"removing stale symlink: {_link}", file=sys.stderr)
+                os.unlink(_link)
+    # --- END --- added for spyre
 
 
 def add_link_to_proton():
@@ -571,16 +743,36 @@ PYTHON_CLASSIFIERS = [
 CLASSIFIERS = BASE_CLASSIFIERS + PYTHON_CLASSIFIERS
 
 setup(
+    # Keep the default distribution/import name compatible with upstream Triton.
+    # Release builds can still override this with TRITON_WHEEL_NAME.
     name=os.environ.get("TRITON_WHEEL_NAME", "triton"),
     version=TRITON_VERSION,
     author="Philippe Tillet",
-    author_email="phil@openai.com",
-    description="A language and compiler for custom Deep Learning operations",
+    maintainer="Triton-Spyre contributors",
+    description="Triton fork with an experimental IBM Spyre backend",
     long_description="",
     license="MIT",
     install_requires=[
         "importlib-metadata; python_version < '3.10'",
     ],
+    # --- START --- added for spyre
+    extras_require={
+        # ktir-cpu provides the numerical interpreter used by the spyre test
+        # suite. Installed WITHOUT its "[mlir-frontend]" extra: that extra pins
+        # ktir-mlir-frontend to ktir-cpu's own commit, which differs from our
+        # third_party/spyre/ktir-mlir-frontend submodule, so it would build the
+        # mlir_ktdp bindings from a different source than the one our submodule
+        # tracks. The numerical tests need mlir_ktdp (MLIRFrontendParser); build
+        # + install it from our submodule so it matches — see the parser note in
+        # third_party/spyre/test/conftest.py. (ktir-cpu must already carry the
+        # MLIRFrontendParser dynamic-shape / batch_matmul adapter fixes.)
+        "spyre-test": [
+            "ktir-cpu @ git+https://github.com/torch-spyre/ktir-cpu@main",
+            "pytest>=7,<9",
+            "numpy>=1.24,<2",
+        ],
+    },
+    # --- END --- added for spyre
     packages=list(get_packages()),
     package_dir=dict(get_package_dirs()),
     entry_points=get_entry_points(),
@@ -603,9 +795,15 @@ setup(
         "sdist": plugin_sdist,
     },
     zip_safe=False,
-    # for PyPI
-    keywords=["Compiler", "Deep Learning"],
-    url="https://github.com/triton-lang/triton/",
+    # Package metadata.
+    keywords=["Compiler", "Deep Learning", "Triton", "Spyre", "KTIR"],
+    url="https://github.com/torch-spyre/triton/",
+    project_urls={
+        "Source": "https://github.com/torch-spyre/triton/",
+        "Issues": "https://github.com/torch-spyre/triton/issues",
+        "Upstream Triton": "https://github.com/triton-lang/triton/",
+        "KTIR MLIR Frontend": "https://github.com/torch-spyre/ktir-mlir-frontend/",
+    },
     python_requires=PYTHON_REQUIRES,
     classifiers=CLASSIFIERS,
 )
