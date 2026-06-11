@@ -1482,18 +1482,12 @@ LogicalResult GatherOp::inferReturnTypes(
 }
 
 // --- START --- added for spyre
-// tt.descriptor_gather / tt.descriptor_scatter accept rank-N source
-// blocks (rank >= 2) — the original rank-2-exact rule, the TMA min-cols
-// rule, and the single-dim cols-match check are loosened or removed
-// below. The leading "block.shape[0] == 1" rule is the load-bearing
-// gather contract and stays enforced.
-//
-// TODO: re-tighten the relaxation behind a Spyre-only module
-// attribute. The attribute would have to be stamped at
-// module-creation time — earlier than `_make_ttir`, since the
-// verifier fires during Triton frontend op construction in
-// `code_generator.py`, before any pass runs. Until that hook exists
-// the relaxation is unconditional.
+// tt.descriptor_gather / tt.descriptor_scatter: under TRITON_BUILD_TTIR_ONLY
+// (the Spyre path), the rank-2-exact rule, the TMA min-cols rule, and the
+// single-dim cols-match check are relaxed or removed. The leading
+// "block.shape[0] == 1" rule is the load-bearing gather contract and is
+// always enforced. GPU builds (#else branches) retain the original upstream
+// checks.
 // --- END --- added for spyre
 
 // -- DescriptorGatherOp
@@ -1503,9 +1497,17 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   if (indicesType.getRank() != 1)
     return op->emitOpError("x offsets must be a 1D tensor, but got ")
            << indicesType;
-  if (resultType.getRank() < 2)                          // --- changed for spyre: was != 2
+  // --- START --- added for spyre: rank-2-exact check relaxed to rank >= 2
+#ifdef TRITON_BUILD_TTIR_ONLY
+  if (resultType.getRank() < 2)
     return op->emitOpError("result must be at least 2D, but got ")
            << resultType;
+#else
+  if (resultType.getRank() != 2)
+    return op->emitOpError("result must be a 2D tensor, but got ")
+           << resultType;
+#endif
+  // --- END --- added for spyre
 
   // The swizzling of TMA accesses matches that of the MMAv3 shared memory
   // layouts. However, these have minimum size requirements.
@@ -1519,13 +1521,18 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   if (dtype.getIntOrFloatBitWidth() > 32)
     return op->emitOpError("TMA dtype cannot be greater than 32 bits");
 
-  // --- changed for spyre: TMA min-cols check removed.
-  // The original rule rejected `result.shape[1] < 32 / bitwidth * 8`.
-  // It enforces an NVIDIA TMA-specific minimum that Spyre does not
-  // lower through; for N-D gather, dim 1 is often legitimately small
-  // (e.g. 1, when y_offset selects a single head). Non-Spyre targets
-  // rejecting tt.descriptor_gather happens at their lowering pass
-  // instead.
+  // --- START --- added for spyre: TMA min-cols check omitted for Spyre.
+  // The original rule rejected result.shape[1] < 32/bitwidth*8, enforcing an
+  // NVIDIA TMA-specific minimum. Spyre does not lower through TMA; dim 1 is
+  // often legitimately small (e.g. 1 when y_offset selects a single head).
+#ifndef TRITON_BUILD_TTIR_ONLY
+  unsigned minCols = 32 / dtype.getIntOrFloatBitWidth() * 8;
+  if (unsigned cols = resultType.getShape()[1]; cols < minCols) {
+    return op->emitOpError("must have at least ")
+           << minCols << " columns for " << dtype << ", but got " << cols;
+  }
+#endif
+  // --- END --- added for spyre
 
   if (resultType.getShape()[0] != indicesType.getShape()[0]) {
     return op->emitOpError("result tensor must have as many rows as indices (")
@@ -1538,13 +1545,20 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
 LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
                                     ShapedType resultType,
                                     ShapedType indicesType) {
-  // Gather from `!tt.tensordesc<1x...xdtype>`. Block rank must be >= 2
-  // (--- changed for spyre: was != 2); the leading 1 is the gather
-  // contract and stays enforced below.
+  // --- START --- added for spyre: block rank-2-exact check relaxed to rank >= 2
+  // Gather from `!tt.tensordesc<1x...xdtype>`; leading 1 is always enforced.
+#ifdef TRITON_BUILD_TTIR_ONLY
   if (blockType.getRank() < 2) {
     return op->emitOpError("descriptor block must be at least 2D, but got ")
            << blockType;
   }
+#else
+  if (blockType.getRank() != 2) {
+    return op->emitOpError("descriptor block must be a 2D tensor, but got ")
+           << blockType;
+  }
+#endif
+  // --- END --- added for spyre
   if (blockType.getShape()[0] != 1) {
     return op->emitOpError("descriptor block must have exactly 1 row, but got ")
            << blockType;
@@ -1554,9 +1568,8 @@ LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
   if (failed(verifyGatherScatterResultType(op, resultType, indicesType)))
     return failure();
 
-  // --- changed for spyre: generalised the original single-dim check
-  // (`result.shape[1] == block.shape[1]`) to a per-dim loop over
-  // `block.shape[1:]` so the cols-match invariant holds at any rank.
+  // --- START --- added for spyre: cols-match generalised to per-dim loop for rank-N
+#ifdef TRITON_BUILD_TTIR_ONLY
   if (blockType.getRank() != resultType.getRank()) {
     return op->emitOpError("result tensor rank must match block rank (")
            << blockType.getRank() << "), but got " << resultType;
@@ -1568,6 +1581,13 @@ LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
              << "), but got " << resultType;
     }
   }
+#else
+  if (resultType.getShape()[1] != blockType.getShape()[1]) {
+    return op->emitOpError("result tensor number of columns must match block (")
+           << blockType.getShape()[1] << "), but got " << resultType;
+  }
+#endif
+  // --- END --- added for spyre
   if (resultType.getElementType() != blockType.getElementType()) {
     return op->emitOpError("result tensor element type must match block (")
            << blockType.getElementType() << "), but got " << resultType;
