@@ -52,19 +52,25 @@ struct ElementwisePropagation : PhysicalPropagationPattern {
     if (op->getNumResults() != 1 ||
         !isa<RankedTensorType>(op->getResult(0).getType()))
       return false;
-    ArrayRef<int64_t> commonShape;
+    // Ops with a rule of their own, excluded by KIND. The shape test below is
+    // satisfied vacuously by a single-operand op, so a reshape or a broadcast
+    // would otherwise be claimed here as though it preserved shape.
+    if (isShapeChangingOp(op))
+      return false;
+
+    // Operands are NOT compared to each other. Mid-analysis they routinely
+    // disagree: Phase 1 physicalizes loads and stops, so an op with one
+    // load-fed operand and one not is guaranteed to see a mismatch. That state
+    // is what this pass exists to resolve, not evidence the op is unknown --
+    // and `propagate` never reads a sibling's shape, so the comparison gated
+    // nothing it needed. Requiring agreement here made an arith.subf whose
+    // operands straddle the split an untaught op, so its result was never
+    // predicted and verifyPhysicalTypeAgreement reported the analysis as
+    // under-claiming once Phase 2B retyped it.
     bool sawTensorOperand = false;
-    for (Value o : op->getOperands()) {
-      auto t = dyn_cast<RankedTensorType>(o.getType());
-      if (!t)
-        continue;
-      if (!sawTensorOperand) {
-        commonShape = t.getShape();
+    for (Value o : op->getOperands())
+      if (isa<RankedTensorType>(o.getType()))
         sawTensorOperand = true;
-      } else if (t.getShape() != commonShape) {
-        return false;
-      }
-    }
     return sawTensorOperand;
   }
 
