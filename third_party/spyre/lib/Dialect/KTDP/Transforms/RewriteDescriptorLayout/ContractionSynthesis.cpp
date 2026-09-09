@@ -1076,6 +1076,22 @@ struct RewriteElementwisePattern : RewritePattern {
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
+    // Ops that have a rule of their own, excluded by KIND rather than inferred
+    // from shape. This pattern's shape test -- every tensor operand agrees with
+    // the others -- is satisfied VACUOUSLY by a single-operand op, so a reshape
+    // or a broadcast would otherwise be retyped here as though it preserved
+    // shape, which is precisely what it does not do. Retyping a
+    // tensor.expand_shape's result to its operand's shape turns the expand into
+    // a no-op and produces a type Phase 2A never predicted, which
+    // verifyPhysicalTypeAgreement then reports as the analysis under-claiming.
+    //
+    // Structural inference is the wrong instrument here: "elementwise" means
+    // shape-preserving, and no count of operands or results establishes that.
+    // Same reasoning that removed isSingleTensorElementwiseOp.
+    // Excluded by KIND via the shared isShapeChangingOp (Types.h): the analysis
+    // and the rewrite must agree on which ops are "elementwise".
+    if (isShapeChangingOp(op))
+      return failure();
     if (op->getNumResults() != 1)
       return failure();
     auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
