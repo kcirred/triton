@@ -189,10 +189,27 @@ struct ReshapeRequirement : RequirementBackwardPattern {
   }
 };
 
-/// linalg.broadcast: the requirement terminates. The result has dims the operand
-/// does not, so no per-dim requirement on it constrains the operand. This is
-/// also what keeps softmax's and layernorm's reduce results out of the map: they
-/// reach their store only through a broadcast.
+/// linalg.broadcast: the requirement PROJECTS onto the carried axes.
+///
+/// The result has dims the operand does not -- that is what a broadcast is --
+/// so the requirement cannot cross unchanged. But it does project: keep the
+/// physical dims whose phys_src names a logical axis the operand CARRIES, drop
+/// those naming an axis the broadcast ADDS. What survives is a requirement of
+/// exactly the operand's logical rank.
+///
+/// For softmax that projection is trivial -- the surviving dim is Identity, so
+/// it asks nothing a rank-1 logical value does not already satisfy. It is still
+/// load-bearing: it is what carries the requirement past this op to the reduce,
+/// which needs `want` non-null to take the Physical space. Once the reduce's
+/// result is in the forward map, the reshapes and then this broadcast acquire a
+/// physical operand, which is what lets BroadcastPropagation be asked at all.
+/// The real shape work happens there, from the store's marker.
+///
+/// Declines when a CARRIED axis is split across two physical dims. Projecting
+/// would then demand an operand of higher rank than it has -- linalg.broadcast
+/// matches its input against the non-broadcast init dims positionally -- so
+/// there is no requirement the operand could satisfy. That is the case the
+/// consuming elementwise op has to repair instead.
 struct BroadcastRequirement : RequirementBackwardPattern {
   bool match(Operation *op) const override {
     return isa<linalg::BroadcastOp>(op);
@@ -201,7 +218,61 @@ struct BroadcastRequirement : RequirementBackwardPattern {
   llvm::FailureOr<LayoutRequirement>
   induce(Operation *op, Value result, Value operand,
          const LayoutRequirement &req) const override {
-    return failure();
+    auto bc = cast<linalg::BroadcastOp>(op);
+    // The init carries the RESULT's shape, so it gets the requirement whole --
+    // the same split TransposeRequirement makes for its own init.
+    if (operand == bc.getInit())
+      return req;
+    if (operand != bc.getInput())
+      return failure();
+
+    // `dimensions` names the added LOGICAL output axes, so the requirement's
+    // logical rank must be the result's rank for the two to be comparable.
+    unsigned logicalRank = 0;
+    for (int64_t d : req.physSrc)
+      logicalRank = std::max(logicalRank, (unsigned)(d + 1));
+    auto resTy = dyn_cast<RankedTensorType>(result.getType());
+    if (!resTy || logicalRank != (unsigned)resTy.getRank())
+      return failure();
+
+    llvm::SmallDenseSet<int64_t> added;
+    for (int64_t d : bc.getDimensions()) {
+      if (d < 0 || d >= (int64_t)logicalRank)
+        return failure();
+      added.insert(d);
+    }
+
+    // A carried axis split across two physical dims cannot be projected: the
+    // operand would need a rank it does not have.
+    for (unsigned p = 0; p < req.physSrc.size(); ++p)
+      if (!added.contains(req.physSrc[p]) &&
+          static_cast<CoordOp>(req.physOp[p]) != CoordOp::Identity)
+        return failure();
+
+    // Renumber the carried logical axes down, since the added ones are gone.
+    llvm::SmallVector<int64_t> logicalRemap(logicalRank, -1);
+    int64_t next = 0;
+    for (unsigned d = 0; d < logicalRank; ++d)
+      if (!added.contains((int64_t)d))
+        logicalRemap[d] = next++;
+
+    LayoutRequirement out;
+    out.marker = req.marker;
+    for (unsigned p = 0; p < req.physSrc.size(); ++p) {
+      int64_t mapped = logicalRemap[req.physSrc[p]];
+      if (mapped < 0)
+        continue;                       // a dim of an added axis: dropped
+      out.physSrc.push_back(mapped);
+      out.physOp.push_back(req.physOp[p]);
+      out.physArg.push_back(req.physArg[p]);
+      out.physExtents.push_back(req.physExtents[p]);
+    }
+    // The projection must have the operand's own rank, or it describes a
+    // different value than the one it is about.
+    auto inTy = dyn_cast<RankedTensorType>(operand.getType());
+    if (!inTy || (int64_t)out.physSrc.size() != inTy.getRank())
+      return failure();
+    return out;
   }
 };
 
