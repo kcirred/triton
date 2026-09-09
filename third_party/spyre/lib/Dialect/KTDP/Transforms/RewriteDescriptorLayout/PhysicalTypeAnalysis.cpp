@@ -267,7 +267,41 @@ struct ReshapePropagation : PhysicalPropagationPattern {
   propagate(Operation *op, Value result, Value src,
             const PhysicalTypeInfo &srcInfo,
             const LayoutRequirement *want) const override {
-    return failure();
+    // The general case declines, for the reason above: a reassociation that
+    // fuses two real axes leaves no physical dim for one of them.
+    //
+    // One narrow case does carry, and it is the one that matters here. When the
+    // value being reshaped is ALREADY at its physical shape -- srcInfo.type
+    // equals the operand's own type -- then physical and logical coincide on
+    // this value, nothing about it is stick-split, and the reshape's own result
+    // type is the physical type. The marker rides along unchanged.
+    //
+    // The test is on the VALUE, not on the marker. The marker a reduce result
+    // carries is the STORE's, which is typically split (phys_op = id/floordiv/
+    // mod); that says nothing about whether this rank-1 value is split. Testing
+    // the marker's ops would reject exactly the case this exists to allow.
+    //
+    // This is what carries a reduce's result past the expand_shape/collapse_shape
+    // pair LowerComputeOps emits between a reduce and a broadcast (rules A3 and
+    // A4 lower tt.expand_dims and tt.broadcast independently, so A3 expands
+    // 1 -> 1x1 and A4 immediately collapses it back). Without it the forward
+    // walk stops there and the broadcast is never asked.
+    auto marker = srcInfo.marker;
+    if (!marker)
+      return failure();
+    if (!srcInfo.transposePerm.empty())
+      return failure();
+
+    auto srcTy = dyn_cast<RankedTensorType>(srcInfo.type);
+    auto operandTy = dyn_cast<RankedTensorType>(src.getType());
+    auto resTy = dyn_cast<RankedTensorType>(result.getType());
+    if (!srcTy || !operandTy || !resTy)
+      return failure();
+    // Physical == logical for this value, or there is a split to rewrite and
+    // no coordinate map can express it across a reassociation.
+    if (srcTy != operandTy)
+      return failure();
+    return PhysicalTypeInfo{resTy, marker, {}};
   }
 };
 
