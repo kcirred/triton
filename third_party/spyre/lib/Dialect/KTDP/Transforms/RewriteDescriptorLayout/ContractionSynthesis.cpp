@@ -27,6 +27,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -1168,6 +1169,86 @@ struct RewriteElementwisePattern : RewritePattern {
 // Pattern: linalg.transpose (erase and record permutation)
 //===----------------------------------------------------------------------===//
 
+// Physicalize a linalg.broadcast whose result Phase 2A decided is physical.
+//
+// A broadcast holds its target shape in two places -- the `outs` operand (a
+// tensor.empty) and the `dimensions` attribute naming which OUTPUT positions
+// are new -- so retyping its result alone is not enough. Both are rewritten
+// here, and both follow mechanically from the marker:
+//
+//   dimensions   each added LOGICAL axis contributes one entry per physical dim
+//                sourced from it: [1] -> [1, 2] when logical axis 1 splits.
+//   outs         applyCoordMap over the logical result shape.
+//
+// The gate is the analysis, not the operand: unlike RewriteTransposePattern,
+// a broadcast's own input is typically logical (its producer is a reduce whose
+// result a reshape leaves logical), so gating on physicalValues.contains(input)
+// would never fire. Phase 2A already decided this result is physical, and only
+// does so when every CARRIED axis is unsplit -- see BroadcastPropagation.
+struct RewriteBroadcastPattern : OpRewritePattern<linalg::BroadcastOp> {
+  const PassContext &ctx;
+  RewriteBroadcastPattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
+
+  LogicalResult matchAndRewrite(linalg::BroadcastOp bc,
+                                PatternRewriter &rewriter) const override {
+    if (!ctx.physicalTypeAnalysis)
+      return failure();
+    auto it = ctx.physicalTypeAnalysis->find(bc.getResult()[0]);
+    if (it == ctx.physicalTypeAnalysis->end())
+      return failure();
+    auto physTy = dyn_cast<RankedTensorType>(it->second.type);
+    if (!physTy)
+      return failure();
+
+    // Idempotence: once the result carries the physical type, stop matching, so
+    // the greedy driver's re-enqueue cannot re-fire this.
+    auto resTy = cast<RankedTensorType>(bc.getResult()[0].getType());
+    if (resTy.getShape() == physTy.getShape())
+      return failure();
+
+    auto marker = it->second.marker;
+    if (!marker)
+      return failure();
+    auto physSrc = marker.getPhysSrc();
+
+    // Renumber `dimensions` from logical output positions to physical ones. An
+    // added logical axis that splits contributes every physical dim sourced
+    // from it, which is what keeps linalg.broadcast's rank arithmetic
+    // (input_rank + |dimensions| == init_rank) true by construction.
+    llvm::SmallDenseSet<int64_t> addedLogical(bc.getDimensions().begin(),
+                                              bc.getDimensions().end());
+    llvm::SmallVector<int64_t> newDims;
+    for (unsigned p = 0; p < physSrc.size(); ++p)
+      if (addedLogical.contains(physSrc[p]))
+        newDims.push_back(p);
+
+    Location loc = bc.getLoc();
+    Value newInit = rebuildPhysicalInit(rewriter, loc, bc.getInit(), physTy);
+    if (!newInit)
+      return failure();
+
+    auto newBc = linalg::BroadcastOp::create(rewriter, loc, bc.getInput(),
+                                            newInit, newDims);
+    Value newResult = newBc.getResult()[0];
+
+    // This result IS physical now, under the layout Phase 2A paired it with.
+    // Record it so a consumer sees a physical value, and carry the analysis's
+    // decision onto the value that replaces the one it was made about.
+    ctx.physicalValues[newResult] = PhysicalValueInfo{marker, {}};
+    ctx.physicalTypes.carryForward(bc.getResult()[0], newResult);
+
+    rewriter.replaceOp(bc, newResult);
+
+    // REQUIRED, as in RewriteElementwisePattern: the result type its users read
+    // just changed, and the greedy driver re-enqueues the modified op but not
+    // its users. A consuming arith.subf whose other operand is already physical
+    // must be revisited so its own match condition sees agreeing shapes.
+    for (Operation *user : llvm::make_early_inc_range(newResult.getUsers()))
+      rewriter.modifyOpInPlace(user, [] {});
+    return success();
+  }
+};
 // The transpose permutation is recorded in ctx.physicalValues (against
 // `input`, which must already be an entry -- see PhysicalValueInfo) because
 // this erase happens before dispatchSource can see the transpose: erasing it
@@ -1353,6 +1434,7 @@ void populateContractionPatterns(RewritePatternSet &patterns,
   patterns.add<RewriteMatmulPattern, RewriteBatchMatmulPattern,
                RewriteReducePattern>(mlirCtx, ctx);
   patterns.add<RewriteTransposePattern>(mlirCtx, ctx);
+  patterns.add<RewriteBroadcastPattern>(mlirCtx, ctx);
   patterns.add<RewriteElementwisePattern>(mlirCtx, ctx);
   patterns.add<RewriteStorePattern>(mlirCtx, ctx);
 }

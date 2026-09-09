@@ -3,11 +3,19 @@
 // Physicalizing `linalg.broadcast` (issue #91).
 //
 // A `tt.spyre_tensor_layout` annotation asks for the Spyre "stick" layout: one
-// logical axis splits into a stick index (floordiv) and a lane (mod), so a
-// logical <64x128> becomes a physical <64x2x64> and the rank goes 2 -> 3.
-// phys_src says which logical axis each physical dim comes from, phys_op is
-// 0=identity / 1=floordiv / 2=mod, and phys_arg is the stick WIDTH (64), not a
-// dim index.
+// logical axis splits into a stick index (floordiv) and a lane (mod), so the
+// rank goes up by one. phys_src says which logical axis each physical dim comes
+// from, phys_op is 0=identity / 1=floordiv / 2=mod, and phys_arg is the stick
+// WIDTH (64), not a dim index.
+//
+// The marker also fixes the ORDER of the physical dims, and that order decides
+// which dims the reduce and the broadcast name. Both orders appear below,
+// because the renumbering must not assume either:
+//
+//   phys_src=[1,0,1] phys_op=[floordiv,identity,mod]   [stick, row, lane]
+//     logical <64x128> -> physical <2x64x64>; split axis owns dims 0 and 2
+//   phys_src=[0,1,1] phys_op=[identity,floordiv,mod]   [row, stick, lane]
+//     logical <64x128> -> physical <64x2x64>; split axis owns dims 1 and 2
 //
 // WHAT THESE TESTS ASK OF THE PASS: when the layout splits an axis the reduce
 // CONSUMES, every axis the broadcast CARRIES stays whole, and the broadcast must
@@ -107,6 +115,55 @@ tt.func @broadcast_only_split_added_axis(%a_ptr: !tt.ptr<f32>, %o_ptr: !tt.ptr<f
   %e = math.exp %bc : tensor<64x128xf32>
   %od = tt.make_tensor_descriptor %o_ptr, [%c64, %c128], [%s128, %s1] : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
   tt.spyre_tensor_layout %od {phys_src = array<i64: 0, 1, 1>, phys_op = array<i64: 0, 1, 2>, phys_arg = array<i64: 0, 64, 64>} : !tt.tensordesc<64x128xf32>
+  tt.descriptor_store %od[%c0, %c0], %e : !tt.tensordesc<64x128xf32>, tensor<64x128xf32>
+  tt.return
+}
+}
+
+// -----
+
+// The same softmax shape under the STICK-OUTERMOST marker, which is the ordering
+// most fixtures in this suite use: phys_src=[1,0,1] puts the stick index at
+// physical dim 0, the untouched row at dim 1, and the lane at dim 2. The split
+// axis therefore owns dims 0 and 2, NOT 1 and 2.
+//
+// This is the case the renumbering could plausibly get wrong: it maps a logical
+// axis to every physical dim sourced from it, and those dims are not adjacent
+// here. A rule that assumed the split axis contributed a contiguous pair, or
+// that read the physical order off the logical order, would produce [1, 2] and
+// silently reduce the wrong axes.
+
+// CHECK-LABEL: func @softmax_broadcast_stick_outermost
+// Stick index leads, so the load is <2x64x64> rather than <64x2x64>.
+// CHECK: ktdp.load {{.*}} -> tensor<2x64x64xf32>
+// Both dims of the split axis are absorbed, and they are 0 and 2.
+// CHECK: linalg.reduce
+// CHECK-SAME: outs(%{{.*}} : tensor<64xf32>)
+// CHECK-SAME: dimensions = [0, 2]
+// The broadcast re-adds the same two, in the same positions.
+// CHECK: linalg.broadcast
+// CHECK-SAME: outs(%{{.*}} : tensor<2x64x64xf32>)
+// CHECK-SAME: dimensions = [0, 2]
+// CHECK: arith.subf %{{.*}}, %{{.*}} : tensor<2x64x64xf32>
+// CHECK: ktdp.store %{{.*}}, %{{.*}} : tensor<2x64x64xf32>
+module {
+tt.func @softmax_broadcast_stick_outermost(%a_ptr: !tt.ptr<f32>, %o_ptr: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : i32
+  %c64 = arith.constant 64 : i32
+  %c128 = arith.constant 128 : i32
+  %s128 = arith.constant 128 : i64
+  %s1 = arith.constant 1 : i64
+  %ad = tt.make_tensor_descriptor %a_ptr, [%c64, %c128], [%s128, %s1] : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
+  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
+  %a = tt.descriptor_load %ad[%c0, %c0] : !tt.tensordesc<64x128xf32> -> tensor<64x128xf32>
+  %m = "tt.reduce"(%a) ({ ^bb0(%x: f32, %y: f32): %mx = arith.maximumf %x, %y : f32
+    tt.reduce.return %mx : f32 }) {axis = 1 : i32} : (tensor<64x128xf32>) -> tensor<64xf32>
+  %me = tt.expand_dims %m {axis = 1 : i32} : tensor<64xf32> -> tensor<64x1xf32>
+  %bc = tt.broadcast %me : tensor<64x1xf32> -> tensor<64x128xf32>
+  %d = arith.subf %a, %bc : tensor<64x128xf32>
+  %e = math.exp %d : tensor<64x128xf32>
+  %od = tt.make_tensor_descriptor %o_ptr, [%c64, %c128], [%s128, %s1] : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
+  tt.spyre_tensor_layout %od {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
   tt.descriptor_store %od[%c0, %c0], %e : !tt.tensordesc<64x128xf32>, tensor<64x128xf32>
   tt.return
 }
