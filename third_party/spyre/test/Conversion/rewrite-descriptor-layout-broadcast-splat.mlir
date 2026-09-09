@@ -1,4 +1,4 @@
-// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout --canonicalize -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout -split-input-file | FileCheck %s
 
 // Seeding a splat constant so layernorm can carry a layout.
 // Design: docs/designs/rewrite-broadcast-pattern.md.
@@ -23,8 +23,9 @@
 // data to move and no coordinate map to rewrite.
 
 // CHECK-LABEL: func @layernorm_splat_divisor
-// The divisor is rebuilt at the physical shape, same repeated value. After
-// canonicalize the dead logical constant is gone, so exactly one remains.
+// The divisor carries the same repeated value at the physical shape. It feeds
+// only this divide, so it is retyped IN PLACE -- no canonicalizer needed to
+// clear a leftover logical copy, and CHECK-NOT below proves none is left.
 // CHECK: %[[N:.*]] = arith.constant dense<1.280000e+02> : tensor<64x2x64xf32>
 // CHECK-NOT: arith.constant dense<1.280000e+02> : tensor<64x128xf32>
 // CHECK: ktdp.load {{.*}} -> tensor<64x2x64xf32>
@@ -126,6 +127,49 @@ tt.func @shared_splat_two_consumers(%a_ptr: !tt.ptr<f32>, %o_ptr: !tt.ptr<f32>, 
   %q = tt.descriptor_load %pd[%c0, %c0] : !tt.tensordesc<64x128xf32> -> tensor<64x128xf32>
   %r = arith.mulf %q, %n : tensor<64x128xf32>
   tt.descriptor_store %pd[%c0, %c0], %r : !tt.tensordesc<64x128xf32>, tensor<64x128xf32>
+  tt.return
+}
+}
+
+// -----
+
+// The layernorm shape under the STICK-OUTERMOST marker, phys_src=[1,0,1], which
+// is the ordering most fixtures in this suite use. The split axis owns physical
+// dims 0 and 2 here rather than 1 and 2, so the seeded constant has to land at
+// <2x64x64> and not <64x2x64>.
+//
+// A splat is indifferent to that order -- every element is the same value, so
+// resizeSplat only needs the total shape -- which is exactly what makes this
+// worth pinning: the seed must take its shape from the physical operand beside
+// it, never reconstruct one from the marker.
+
+// CHECK-LABEL: func @layernorm_splat_stick_outermost
+// CHECK: %[[N:.*]] = arith.constant dense<1.280000e+02> : tensor<2x64x64xf32>
+// CHECK-NOT: arith.constant dense<1.280000e+02> : tensor<64x128xf32>
+// CHECK: linalg.reduce
+// CHECK-SAME: dimensions = [0, 2]
+// CHECK: arith.divf %{{.*}}, %[[N]] : tensor<2x64x64xf32>
+// CHECK: ktdp.store %{{.*}}, %{{.*}} : tensor<2x64x64xf32>
+module {
+tt.func @layernorm_splat_stick_outermost(%a_ptr: !tt.ptr<f32>, %o_ptr: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : i32
+  %c64 = arith.constant 64 : i32
+  %c128 = arith.constant 128 : i32
+  %s128 = arith.constant 128 : i64
+  %s1 = arith.constant 1 : i64
+  %n = arith.constant dense<1.280000e+02> : tensor<64x128xf32>
+  %ad = tt.make_tensor_descriptor %a_ptr, [%c64, %c128], [%s128, %s1] : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
+  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
+  %a = tt.descriptor_load %ad[%c0, %c0] : !tt.tensordesc<64x128xf32> -> tensor<64x128xf32>
+  %s = "tt.reduce"(%a) ({ ^bb0(%x: f32, %y: f32): %sm = arith.addf %x, %y : f32
+    tt.reduce.return %sm : f32 }) {axis = 1 : i32} : (tensor<64x128xf32>) -> tensor<64xf32>
+  %se = tt.expand_dims %s {axis = 1 : i32} : tensor<64xf32> -> tensor<64x1xf32>
+  %sb = tt.broadcast %se : tensor<64x1xf32> -> tensor<64x128xf32>
+  %mean = arith.divf %sb, %n : tensor<64x128xf32>
+  %d = arith.subf %a, %mean : tensor<64x128xf32>
+  %od = tt.make_tensor_descriptor %o_ptr, [%c64, %c128], [%s128, %s1] : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
+  tt.spyre_tensor_layout %od {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
+  tt.descriptor_store %od[%c0, %c0], %d : !tt.tensordesc<64x128xf32>, tensor<64x128xf32>
   tt.return
 }
 }
