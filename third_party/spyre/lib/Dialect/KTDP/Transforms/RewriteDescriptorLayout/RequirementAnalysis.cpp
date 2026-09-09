@@ -81,19 +81,21 @@ struct ElementwiseRequirement : RequirementBackwardPattern {
     if (op->getNumResults() != 1 ||
         !isa<RankedTensorType>(op->getResult(0).getType()))
       return false;
-    ArrayRef<int64_t> commonShape;
+    // Deliberately does NOT compare operand shapes to each other. Mid-analysis
+    // the IR is half-retyped -- Phase 1 physicalizes loads and stops -- so a
+    // sibling operand being a different shape is the state this pass exists to
+    // resolve, not evidence that the op is unknown. An elementwise op's
+    // requirement is the same on every operand regardless (induce is `return
+    // req`), so the comparison gates nothing it needs.
+    //
+    // Shape-changing ops are excluded by KIND; isShapeChangingOp (Types.h) is
+    // the one list all three elementwise predicates share, and states why.
+    if (isShapeChangingOp(op))
+      return false;
     bool sawTensorOperand = false;
-    for (Value o : op->getOperands()) {
-      auto t = dyn_cast<RankedTensorType>(o.getType());
-      if (!t)
-        continue;
-      if (!sawTensorOperand) {
-        commonShape = t.getShape();
+    for (Value o : op->getOperands())
+      if (isa<RankedTensorType>(o.getType()))
         sawTensorOperand = true;
-      } else if (t.getShape() != commonShape) {
-        return false;
-      }
-    }
     return sawTensorOperand;
   }
 
