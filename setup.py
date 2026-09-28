@@ -814,7 +814,7 @@ setup(
         #
         "spyre-device": [
             "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre"
-            "@f7a8c05365d7de5eebe8d2f10377e627801164c9",
+            "@0c964dbb066dfc1b0c79761abe516c0b9e6daa47",
         ],
     },
     # --- END --- added for spyre
