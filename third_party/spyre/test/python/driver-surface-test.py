@@ -91,11 +91,9 @@ class _FakeSymbolKind:
     ``importorskip`` does not catch. What is under test is which entries the
     launcher builds and in what order, not torch-spyre's dataclass.
 
-    Only ``kernel`` is provided. The launcher building a ``pool``, ``dimension``
-    or ``kernel_slice`` entry is not a variant this test tolerates but a bug: the
-    runner shifts every ``tensor_id`` by one for a leading pool entry, so it would
-    offset every symbol onto its neighbour's address. Absent here, that shows up
-    as an AttributeError rather than as a passing test.
+    Only ``kernel`` is provided, which is the only variant the launcher builds.
+    Absent here, any other shows up as an AttributeError rather than as a
+    passing test.
     """
 
     def __init__(self, kind, arg_index):
@@ -105,10 +103,6 @@ class _FakeSymbolKind:
     @classmethod
     def kernel(cls, arg_index):
         return cls("kernel", arg_index)
-
-    @property
-    def is_pool(self):
-        return self.kind == "pool"
 
 
 def _install_fake_symbol_kind(monkeypatch):
@@ -504,15 +498,6 @@ class TestSymbolicArgs:
         # the wrong order is silent wrong numerics, not an error.
         assert [entry.arg_index for entry in payload] == [0, 1, 2]
         assert all(entry.kind == "kernel" for entry in payload)
-
-    def test_no_pool_entry_leads_the_payload(self, monkeypatch):
-        # A leading pool entry makes the runner shift every tensor_id by one, to
-        # skip the pool tensor Inductor's call_kernel prepends. This backend
-        # prepends nothing, so a pool entry here would read each symbol's address
-        # from the next tensor along -- in range, and wrong.
-        _install_fake_symbol_kind(monkeypatch)
-        launcher = SpyreLauncher(_Src({}), _Metadata(True))
-        assert not any(entry.is_pool for entry in launcher._symbol_kinds(3))
 
     def test_payload_length_is_the_address_count(self, monkeypatch):
         # The length is what JobPlanStepHostCompute::construct TORCH_CHECKs

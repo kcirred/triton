@@ -364,12 +364,6 @@ class SpyreLauncher:
         ``SymbolicArg(kind=kAddress, tensor_id=arg_index)``; for this list that
         is ``tensor_id == i``, i.e. the launch tensor at position *i*.
 
-        Handed to the runner's constructor rather than to ``run()``, because
-        that is where the payload now lives: the runner builds it once, in
-        ``__init__``, and ``run(*args)`` takes no keyword. The value is
-        launch-invariant, so building it once per compiled kernel is also where
-        it belongs.
-
         Passing *something* is the point, not a formality. With a payload,
         ``JobPlanStepHostCompute::construct`` TORCH_CHECKs its length against
         the compiled symbol count (``hcm_->vdci.inputSym_.size()``) and a
@@ -378,13 +372,6 @@ class SpyreLauncher:
         context tensor as an address source and patch however many it finds --
         which is the silent wrong-segment failure the typed payload exists to
         prevent.
-
-        ``pool`` entries are deliberately absent. The runner shifts every
-        ``tensor_id`` by one when ``symbol_kinds[0].is_pool``, because
-        Inductor's ``call_kernel`` prepends a pool tensor to ``args``. This
-        backend prepends nothing -- ``_address_args`` returns exactly the
-        kernel's own pointer arguments -- so a pool entry here would offset
-        every symbol onto its neighbour's address.
 
         ``None`` in baked mode, where there are no symbols to patch: the
         addresses are ``arith.constant`` in the binary, and the runner then
