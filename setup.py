@@ -812,11 +812,6 @@ setup(
         #   * it wants torch~=2.13, while spyre-test pins numpy<2 for ktir-cpu's
         #     MLIR ABI — a joint constraint neither side asked for.
         #
-        # The floor is the commit that gave SpyreSDSCKernelRunner its
-        # symbol_kinds parameter (#3846): SpyreLauncher builds that payload and
-        # hands it to the constructor, and an earlier torch-spyre has no such
-        # parameter, so a launch raises TypeError there rather than running.
-        # Nothing in CI installs this extra, so nothing here catches a stale pin.
         "spyre-device": [
             "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre"
             "@f7a8c05365d7de5eebe8d2f10377e627801164c9",
