@@ -3,11 +3,17 @@
 Three ``@triton.jit`` functions, all loop-free and single-tile so they reach the
 device tier:
 
-- :func:`compare_1d_device` -- ``(x > y).to(dtype)``, the comparison alone,
+- :func:`compare_1d_device` -- ``(x OP y).to(dtype)``, the comparison alone,
   writing its 1.0/0.0 answer to a buffer.
 - :func:`select_1d_device`  -- the select alone, over a mask the host wrote.
 - :func:`where_1d_device`   -- both in one kernel, with the mask spilled to its
   own buffer between them.
+
+``OP`` is a constexpr naming the comparison, one of :data:`COMPARISONS`. Each
+name lowers to one ordered ``arith.cmpf`` predicate, and each of those has its
+own ``spyreop.compare`` predicate, so sweeping ``OP`` covers every float
+comparison operator the device can select. ``!=`` is the exception, and
+:data:`COMPARISONS` says why it is left out.
 
 :func:`where_1d_device` spills the mask rather than keeping it in registers
 because a value with no descriptor has no ``tt.spyre_tensor_layout``.
@@ -37,6 +43,52 @@ import triton
 import triton.language as tl
 
 
+# The constexpr spellings ``OP`` accepts, and the Python operator each one is.
+# On floats the frontend lowers each to an ORDERED ``arith.cmpf`` predicate
+# (``ogt``, ``oge``, ``oeq``, ``ole``, ``olt``), false wherever either operand is
+# NaN, and ``spyreop.compare`` has an ordered predicate for each.
+#
+# ``!=`` is absent because it cannot reach the device. The frontend lowers it to
+# the UNORDERED ``une`` -- true where either operand is NaN, as IEEE-754 says --
+# while ``spyreop.compare <notequal>`` is ordered and answers zero there. The two
+# compute different values on a NaN lane, so LowerSpyreOps declines ``une`` and
+# the compile fails on the ``i1`` it leaves behind. That refusal is pinned in
+# ``test/Transforms/LowerSpyreOps/compare-invalid.mlir`` (``@unordered_notequal``).
+# The select's own ``mask != 0`` is also ``une``, but it is not affected: it
+# folds into ``spyreop.select``, whose non-zero test agrees with ``une`` on every
+# lane, NaN included.
+COMPARISONS = {
+    "gt": ">",
+    "ge": ">=",
+    "eq": "==",
+    "le": "<=",
+    "lt": "<",
+}
+
+
+@triton.jit
+def _compare(x, y, OP: tl.constexpr):
+    """``x OP y`` for an ``OP`` named in :data:`COMPARISONS`.
+
+    Resolved at compile time, so each specialization carries exactly one
+    ``arith.cmpf``. An unknown name fails the compile rather than falling
+    through to some default comparison.
+    """
+    if OP == "gt":
+        result = x > y
+    elif OP == "ge":
+        result = x >= y
+    elif OP == "eq":
+        result = x == y
+    elif OP == "le":
+        result = x <= y
+    elif OP == "lt":
+        result = x < y
+    else:
+        tl.static_assert(False, "OP must be one of gt, ge, eq, le, lt")
+    return result
+
+
 @triton.jit
 def compare_1d_device(
     x_ptr,
@@ -45,8 +97,9 @@ def compare_1d_device(
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
 ):
-    """``mask = (x > y)`` as 1.0/0.0 in the compared width, over one tile.
+    """``mask = (x OP y)`` as 1.0/0.0 in the compared width, over one tile.
 
     The device has no boolean type, so ``spyreop.compare`` answers with a number.
     The ``.to()`` is absorbed into that intrinsic, and the pair emits one op.
@@ -69,7 +122,7 @@ def compare_1d_device(
     offset = pid * BLOCK_SIZE
     x = x_desc.load([offset])
     y = y_desc.load([offset])
-    mask_desc.store([offset], (x > y).to(x.dtype))
+    mask_desc.store([offset], _compare(x, y, OP).to(x.dtype))
 
 
 @triton.jit
@@ -125,8 +178,9 @@ def where_1d_device(
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
 ):
-    """``out = where(x > y, p, q)`` in one kernel, with the mask spilled.
+    """``out = where(x OP y, p, q)`` in one kernel, with the mask spilled.
 
     ``mask_ptr`` is scratch rather than data: the module docstring says why the
     mask cannot stay in registers. The branches ``p``/``q`` are separate from the
@@ -165,7 +219,7 @@ def where_1d_device(
     # Stage 1: the comparison, stored to its own buffer.
     x = x_desc.load([offset])
     y = y_desc.load([offset])
-    mask_desc.store([offset], (x > y).to(x.dtype))
+    mask_desc.store([offset], _compare(x, y, OP).to(x.dtype))
 
     # Stage 2: the select, over the mask read back. Reloading is what gives the
     # intermediate a descriptor, and with it a layout.
