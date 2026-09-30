@@ -9,11 +9,8 @@ device tier:
 - :func:`where_1d_device`   -- both in one kernel, with the mask spilled to its
   own buffer between them.
 
-``OP`` is a constexpr naming the comparison, one of :data:`COMPARISONS`. Each
-name lowers to one ordered ``arith.cmpf`` predicate, and each of those has its
-own ``spyreop.compare`` predicate, so sweeping ``OP`` covers every float
-comparison operator the device can select. ``!=`` is the exception, and
-:data:`COMPARISONS` says why it is left out.
+``OP`` selects one of the six comparisons in :data:`COMPARISONS` at compile
+time. Fixture inputs contain no NaNs.
 
 :func:`where_1d_device` spills the mask rather than keeping it in registers
 because a value with no descriptor has no ``tt.spyre_tensor_layout``.
@@ -43,24 +40,12 @@ import triton
 import triton.language as tl
 
 
-# The constexpr spellings ``OP`` accepts, and the Python operator each one is.
-# On floats the frontend lowers each to an ORDERED ``arith.cmpf`` predicate
-# (``ogt``, ``oge``, ``oeq``, ``ole``, ``olt``), false wherever either operand is
-# NaN, and ``spyreop.compare`` has an ordered predicate for each.
-#
-# ``!=`` is absent because it cannot reach the device. The frontend lowers it to
-# the UNORDERED ``une`` -- true where either operand is NaN, as IEEE-754 says --
-# while ``spyreop.compare <notequal>`` is ordered and answers zero there. The two
-# compute different values on a NaN lane, so LowerSpyreOps declines ``une`` and
-# the compile fails on the ``i1`` it leaves behind. That refusal is pinned in
-# ``test/Transforms/LowerSpyreOps/compare-invalid.mlir`` (``@unordered_notequal``).
-# The select's own ``mask != 0`` is also ``une``, but it is not affected: it
-# folds into ``spyreop.select``, whose non-zero test agrees with ``une`` on every
-# lane, NaN included.
+# Comparison names accepted by OP; meta.py supplies matching NumPy operators.
 COMPARISONS = {
     "gt": ">",
     "ge": ">=",
     "eq": "==",
+    "ne": "!=",
     "le": "<=",
     "lt": "<",
 }
@@ -80,12 +65,14 @@ def _compare(x, y, OP: tl.constexpr):
         result = x >= y
     elif OP == "eq":
         result = x == y
+    elif OP == "ne":
+        result = x != y
     elif OP == "le":
         result = x <= y
     elif OP == "lt":
         result = x < y
     else:
-        tl.static_assert(False, "OP must be one of gt, ge, eq, le, lt")
+        tl.static_assert(False, "OP must be one of gt, ge, eq, ne, le, lt")
     return result
 
 

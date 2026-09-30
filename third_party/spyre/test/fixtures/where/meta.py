@@ -52,6 +52,7 @@ _NUMPY_COMPARISONS = {
     "gt": operator.gt,
     "ge": operator.ge,
     "eq": operator.eq,
+    "ne": operator.ne,
     "le": operator.le,
     "lt": operator.lt,
 }
