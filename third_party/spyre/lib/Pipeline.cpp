@@ -28,15 +28,6 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // would handle the tensor-of-pointers tt.load this one leaves legal.]
   pm.addPass(createLowerScalarLoadPass());
 
-  // Each tts marker op's annotation -> an attribute on the op the value it
-  // names resolved to. Bounded on both sides: after LowerDescriptorMemory,
-  // because the op a tts.tensor_layout lands on is the memory view that pass
-  // builds and the bridge cast it resolves through is that pass's; before
-  // LowerComputeOps, which is a partial conversion that knows nothing of tts
-  // and would fail the marker as unconverted. LowerScalarLoad in between is
-  // indifferent to markers and merely keeps them legal.
-  pm.addPass(tts::createLowerTTSMarkersPass());
-
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
 
@@ -62,6 +53,40 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // created after this runs and the canonicalize this stage ends with is not the
   // one that folds it.
   pm.addPass(mlir::createCanonicalizerPass());
+
+  // LAST, and after that canonicalize rather than before it. Each tts marker op's
+  // annotation -> an attribute on the op the marked value resolved to.
+  //
+  // Bounded below by two passes, one per marker. LowerDescriptorMemory, because a
+  // tts.tensor_layout lands on the memory view that pass builds, reached through
+  // the bridge cast it also builds. LowerComputeOps, because a tts.pin lands on
+  // the op PRODUCING the pinned value, so that op has to be in its final form --
+  // a pinned reduction is a tt.reduce until there and a linalg.reduce after, and
+  // an attribute written on the tt.reduce would go with it.
+  //
+  // Bounded from above by the canonicalize, and that bound is the subtle one. A
+  // marker op is not memory-effect-free, so DCE leaves it alone -- and while it
+  // survives it USES the value it marks, which is what keeps that value alive. The
+  // attribute does not: it rides on the producer, and a producer whose results are
+  // otherwise unused is trivially dead. So converting a marker before the DCE can
+  // delete the very value it asked to place, attribute and all.
+  //
+  // That is not hypothetical. A relayout's share is consumed by the compose, which
+  // consumes it by erasing the marker; with the conversion done early, the share's
+  // producer is dead by the time this stage's canonicalize runs, and the pin is gone
+  // before anything could honour it. Running here instead means the marker holds the
+  // value through the DCE and the attribute is written when nothing left in this
+  // stage deletes anything.
+  //
+  // Nothing in this stage reads the attributes, which is what makes the move free:
+  // every consumer is in `spyrecode` -- RewriteDescriptorLayoutGeneric and
+  // FoldDataMovementGenerics today, and the pin's own consumer when it lands, at the
+  // head of that stage -- so no DCE runs between the write and the honouring.
+  //
+  // Markers must not cross into the artifact, and do not: this is the last pass, so
+  // what leaves the stage is attributes. An op from a dialect a consumer does not
+  // load fails at parse, which is the whole reason the annotation is an attribute.
+  pm.addPass(tts::createLowerTTSMarkersPass());
 }
 
 void mlir::triton::spyre::buildSpyrecodePipeline(
@@ -166,7 +191,7 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // behaviour it changes -- left in place, a data-movement generic has no layout
   // marker, so that pass leaves its result logical and bridges the gap with a
   // linearizing operand map the scheduler cannot project loop IVs through.
-  pm.addPass(createFoldDataMovementGenericsPass());
+  pm.addPass(createFuseComputeAndDataMovementPass());
 
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the
   // `tts.tensor_layout` attribute LowerTTSMarkers wrote onto each annotated
@@ -194,10 +219,24 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // dbo-opt's compute-group extraction aborts. See issue #161.
   pm.addPass(mlir::createCanonicalizerPass());
 
-  // Scalar math/arith (math.sqrt/exp/rsqrt, arith.divf, arith.addi/muli inside
-  // a linalg.generic body) -> the spyreop spelling the scheduler expects. After
-  // ConvertElementwiseToLinalg above -- which is now in this stage rather than the
-  // previous one -- so the op it matches is already inside a linalg.generic body.
+  // Instruction selection: the arith and math ops in each compute body become the
+  // spyreop intrinsics that do the same thing. One pass for all of it -- the
+  // one-op-to-one rules and the group rules share a pattern set, each rooted on
+  // a different op.
+  //
+  // Needs every compute to be a linalg.generic, which the passes above make it: a
+  // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed
+  // op alone.
+  //
+  // And it needs FuseComputeAndDataMovement to have run, which it has, well above. A rule
+  // matches ops in ONE body while ConvertElementwiseToLinalg gives every
+  // tensor-level op a body of its own, so a group spanning two tensor ops is two
+  // generics until something fuses them -- that pass's `i1` clause is what does,
+  // and the compare rule fires only because of it. The reciprocal is the softer
+  // case: it reads its numerator through the body, so it fires either way.
+  //
+  // Nothing is reported here. An op with no device form flows through to dbo-opt,
+  // which is the component that knows what it can take.
   pm.addPass(createLowerSpyreOpsPass());
 
   if (options.bindBaseAddresses) {
