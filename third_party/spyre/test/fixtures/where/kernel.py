@@ -1,13 +1,15 @@
 """``tl.where`` kernels: a comparison, a select, and both with a spill.
 
-Three ``@triton.jit`` functions, all loop-free and single-tile so they reach the
+Four ``@triton.jit`` functions, all loop-free and single-tile so they reach the
 device tier:
 
 - :func:`compare_1d_device` -- ``(x OP y).to(dtype)``, the comparison alone,
-  writing its 1.0/0.0 answer to a buffer.
+  writing 1.0 where it holds and 0.0 where it does not to a buffer.
 - :func:`select_1d_device`  -- the select alone, over a mask the host wrote.
 - :func:`where_1d_device`   -- both in one kernel, with the mask spilled to its
   own buffer between them.
+- :func:`where_scalar_stick_device` -- :func:`where_1d_device` with ``y`` one
+  scalar, read from a one-stick buffer the host filled.
 
 ``OP`` selects one of the six comparisons in :data:`COMPARISONS` at compile
 time. Fixture inputs contain no NaNs.
@@ -86,7 +88,8 @@ def compare_1d_device(
     LAYOUT: tl.constexpr,
     OP: tl.constexpr,
 ):
-    """``mask = (x OP y)`` as 1.0/0.0 in the compared width, over one tile.
+    """``mask = (x OP y)`` over one tile: 1.0 where true and 0.0 where false,
+    in the compared width.
 
     The device has no boolean type, so ``spyreop.compare`` answers with a number.
     The ``.to()`` is absorbed into that intrinsic, and the pair emits one op.
@@ -215,3 +218,76 @@ def where_1d_device(
     q = q_desc.load([offset])
     zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
     out_desc.store([offset], tl.where(mask != zero, p, q))
+
+
+@triton.jit
+def where_scalar_stick_device(
+    x_ptr,
+    scalar_ptr,
+    p_ptr,
+    q_ptr,
+    mask_ptr,
+    output_ptr,
+    ROWS: tl.constexpr,
+    STICK: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
+):
+    """``out = where(x OP scalar, p, q)``, the scalar read from memory.
+
+    ``x``, ``p``, ``q``, ``mask`` and ``out`` are ``[ROWS, STICK]``, one tile.
+    ``STICK`` is the stick width at the pointers' dtype (64 lanes at fp16, 32 at
+    fp32), so each row is one stick. ``scalar_ptr`` is ONE stick, ``[1, STICK]``,
+    holding the scalar in every lane. The host fills it.
+
+    The scalar comes from memory, not from ``tl.full``, because of what
+    ``dbo-opt`` accepts. A constant tensor operand is folded by upstream
+    ``FoldScalarOrSplatConstant`` (inside ``FuseComputeAndDataMovement``) into a
+    scalar captured by the compare's body. The device's vector compare then
+    finds an ``f16`` where it requires a vector, and ``dbo-opt`` refuses it.
+    Loaded from a stick, the scalar is an ordinary input of the compare. The
+    broadcast over ``ROWS`` ends up in that input's indexing map as
+    ``(d0, d1, d2) -> (d0, 0, d2)``, which reads the same stick for every row
+    and walks its lanes. That is the form torch-spyre's KTIR emitter produces
+    for a scalar operand.
+
+    The kernel is 2-D because the broadcast needs a row axis to repeat over. In
+    1-D, a ``[STICK]`` operand has no shape that broadcasts to the tile.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[ROWS, STICK], strides=[STICK, 1], block_shape=[ROWS, STICK],
+    )
+    scalar_desc = tl.make_tensor_descriptor(
+        scalar_ptr, shape=[1, STICK], strides=[STICK, 1], block_shape=[1, STICK],
+    )
+    p_desc = tl.make_tensor_descriptor(
+        p_ptr, shape=[ROWS, STICK], strides=[STICK, 1], block_shape=[ROWS, STICK],
+    )
+    q_desc = tl.make_tensor_descriptor(
+        q_ptr, shape=[ROWS, STICK], strides=[STICK, 1], block_shape=[ROWS, STICK],
+    )
+    mask_desc = tl.make_tensor_descriptor(
+        mask_ptr, shape=[ROWS, STICK], strides=[STICK, 1], block_shape=[ROWS, STICK],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[ROWS, STICK], strides=[STICK, 1], block_shape=[ROWS, STICK],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(scalar_desc, LAYOUT)
+    tl.spyre_tensor_layout(p_desc, LAYOUT)
+    tl.spyre_tensor_layout(q_desc, LAYOUT)
+    tl.spyre_tensor_layout(mask_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    # Stage 1: the comparison against the broadcast stick, stored to its own
+    # buffer, as in where_1d_device.
+    x = x_desc.load([0, 0])
+    scalar = tl.broadcast_to(scalar_desc.load([0, 0]), [ROWS, STICK])
+    mask_desc.store([0, 0], _compare(x, scalar, OP).to(x.dtype))
+
+    # Stage 2: the select, over the mask read back.
+    mask = mask_desc.load([0, 0])
+    p = p_desc.load([0, 0])
+    q = q_desc.load([0, 0])
+    zero = tl.zeros([ROWS, STICK], dtype=mask.dtype)
+    out_desc.store([0, 0], tl.where(mask != zero, p, q))
