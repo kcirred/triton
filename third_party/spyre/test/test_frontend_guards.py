@@ -119,6 +119,7 @@ class TestRequiresBackend:
         assert "'cuda'" in msg
 
 
+
 # ---------------------------------------------------------------------------
 # tl.spyre_tensor_layout — the decorator's one call site
 # ---------------------------------------------------------------------------
@@ -538,3 +539,58 @@ class TestSpyrePin:
         # rather than only the refusal: pin the loop's RESULT, which an op produces.
         self._raises(k, "not one an op in the kernel produced")
         self._raises(k, "pin the loop's RESULT")
+
+
+# ---------------------------------------------------------------------------
+# The decorator's call sites
+# ---------------------------------------------------------------------------
+
+class TestWkSliceCoordGuard:
+    """``tl.wk_slice_coord`` carries the decorator, so the guard fires before
+    the builtin touches ``_semantic`` or its arguments."""
+
+    @pytest.mark.parametrize("backend", ["cuda", "hip", None])
+    def test_raises_off_backend(self, as_backend, backend):
+        as_backend(backend)
+        with pytest.raises(ValueError, match="only supported on the 'spyre' backend"):
+            tl.wk_slice_coord([{"x": 0}], "x", _semantic=object())
+
+
+class TestWkSliceCoordInTracedIR:
+    """``tl.wk_slice_coord`` folds the constexpr per-tile column into a select
+    chain on ``tl.program_id(0)``: one ``arith.select`` per tile, each choosing
+    that tile's coordinate."""
+
+    WORK_SLICES = [{"x": 0, "n": 5}, {"x": 0, "n": 7}, {"x": 1, "n": 9}]
+
+    @staticmethod
+    def _ttir(work_slices, axis):
+        import triton
+        import triton.language as tl
+        from utils import compile_to_ttir
+
+        @triton.jit
+        def coord(out_ptr, WORK_SLICES: tl.constexpr, AXIS: tl.constexpr):
+            tl.store(out_ptr, tl.wk_slice_coord(WORK_SLICES, AXIS))
+
+        signature = {"out_ptr": "*i32", "WORK_SLICES": "constexpr",
+                     "AXIS": "constexpr"}
+        return compile_to_ttir(coord, signature,
+                               {"WORK_SLICES": work_slices, "AXIS": axis})
+
+    def test_one_select_per_tile(self, as_backend):
+        as_backend("spyre")
+        ttir = self._ttir(self.WORK_SLICES, "n")
+        assert "tt.get_program_id x" in ttir
+        assert ttir.count("arith.select") == len(self.WORK_SLICES)
+
+    def test_selects_the_axis_column(self, as_backend):
+        as_backend("spyre")
+        ttir = self._ttir(self.WORK_SLICES, "n")
+        for c in (5, 7, 9):
+            assert f"arith.constant {c} : i32" in ttir
+
+    def test_axis_missing_from_a_tile_raises(self, as_backend):
+        as_backend("spyre")
+        with pytest.raises(Exception, match="axis 'n' missing from work_slices\\[1\\]"):
+            self._ttir([{"n": 0}, {"x": 1}], "n")
